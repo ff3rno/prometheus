@@ -1,0 +1,1 @@
+declare module 'bfx-hf-indicators';

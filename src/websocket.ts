@@ -1,7 +1,7 @@
 import WS from 'ws';
 import { BITMEX_WS_API_URL } from './constants';
 import { BitMEXTrade } from './types';
-import { OrderManager } from './orderManager';
+import { OrderManager } from './order_manager';
 import { StatsLogger } from './logger';
 
 // WebSocket connection states for better logging

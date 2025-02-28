@@ -29,14 +29,13 @@
     "lint:markdownlint": "markdownlint README.md",
     "lint:markdownlint:fix": "markdownlint --fix README.md",
     "lint:yaml": "yamllint -f auto -s .yamlfmt.yml .yamllint.yml",
-    "lint:yaml:fix": [
-      "yamlfmt -conf .yamlfmt.yml -quiet -dry -dstar .yamlfmt.yml .yamllint.yml"
-    ],
+    "lint:yaml:fix": "yamlfmt -conf .yamlfmt.yml -quiet -dry -dstar .yamlfmt.yml .yamllint.yml",
     "prepare": "husky",
     "prepare-release": "pnpm build && git add docs",
     "prepublish": "pnpm build",
     "release": "pnpm prepare-release && pnpm update-version && git push --follow-tags origin main",
-    "start": "ts-node src/index.ts",
+    "start:pp-sim": "ts-node src/pp_sim_main.ts",
+    "start:ai-intel": "ts-node src/ai_intel_main.ts",
     "serve:coverage": "http-server ./coverage",
     "serve:docs": "http-server ./docs",
     "test": "NODE_PATH=./src NODE_ENV=test vitest",
@@ -44,6 +43,8 @@
     "update-version": "standard-version -a"
   },
   "dependencies": {
+    "axios": "^1.8.1",
+    "bfx-hf-indicators": "^2.0.8",
     "signale": "^1.4.0",
     "tslib": "^2.8.1",
     "ws": "^8.18.1"
@@ -55,6 +56,7 @@
     "@commitlint/types": "^19.5.0",
     "@eslint/js": "^10.0.0",
     "@istanbuljs/nyc-config-typescript": "^1.0.2",
+    "@types/axios": "^0.14.4",
     "@types/eslint__js": "^9.14.0",
     "@types/node": "^22.13.5",
     "@types/signale": "^1.4.7",

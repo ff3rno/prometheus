@@ -1,5 +1,5 @@
 import { StatsLogger } from './logger';
-import { OrderManager } from './orderManager';
+import { OrderManager } from './order_manager';
 import { BitMEXWebSocket } from './websocket';
 
 // Create a logger instance
