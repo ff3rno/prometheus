@@ -16,7 +16,7 @@ export class StatsLogger {
   }
 
   private getStatsPrefix(): string {
-    return `[$${this.cumulativePnL.toFixed(2)}|${this.totalTrades}|${this.activeOrders} ORDERS|FEES:$${this.cumulativeFees.toFixed(4)}|VOL:${this.cumulativeVolume.toFixed(4)}]`;
+    return `[$${this.cumulativePnL.toFixed(6)}|${this.totalTrades}|${this.activeOrders} ORDERS|FEES:$${this.cumulativeFees.toFixed(4)}|VOL:${this.cumulativeVolume.toFixed(4)}]`;
   }
 
   recordTrade(profit: number, fees: number = 0, volume: number = 0): void {

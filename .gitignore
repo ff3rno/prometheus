@@ -1,9 +1,10 @@
-/.undodir
+g.undodir
 /.nyc_output
 /.yalc
 /node_modules
 /coverage
 /dist
+/data
 tags
 todo
 tsconfig.tsbuildinfo
