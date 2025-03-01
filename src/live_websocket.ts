@@ -110,6 +110,13 @@ export class LiveWebSocket {
         ]
       }));
       this.logger.success(`Subscribed to ${this.symbol} trade data and execution updates`);
+      
+      // Request current state of orders
+      this.ws.send(JSON.stringify({
+        op: 'subscribe',
+        args: ['order:' + this.symbol]
+      }));
+      this.logger.info(`Requested current order state for ${this.symbol}`);
     } else {
       // Unauthenticated connection - only subscribe to public trade data
       this.ws.send(JSON.stringify({
@@ -155,6 +162,15 @@ export class LiveWebSocket {
       message.data.forEach((order: any) => {
         if (order.ordStatus === 'Filled') {
           this.logger.success(`Order ${order.orderID} status changed to Filled`);
+          
+          // Also process the fill through the order manager to ensure it's detected
+          // If it was already processed via execution event, the order manager will handle the duplicate
+          this.orderManager.handleOrderFill(
+            order.orderID,
+            order.price,
+            order.side,
+            order.orderQty
+          );
         } else if (order.ordStatus === 'Canceled') {
           this.logger.warn(`Order ${order.orderID} was cancelled`);
         }

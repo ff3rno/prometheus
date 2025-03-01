@@ -53,6 +53,29 @@ const run = async (): Promise<void> => {
     // Initialize BitMEX API client
     const api = new BitMEXAPI(API_KEY, API_SECRET, logger, false);
     
+    // Fetch all active instruments to cache them for later use
+    try {
+      logger.info('Pre-fetching all active instruments...');
+      const instruments = await api.getActiveInstruments();
+      logger.success(`Cached ${instruments.length} active instruments for quick access`);
+      
+      // Log details about our trading instrument
+      const tradingInstrument = instruments.find(i => i.symbol === SYMBOL);
+      if (tradingInstrument) {
+        logger.info(`Trading instrument details: ${SYMBOL}`);
+        logger.info(`  Type: ${tradingInstrument.typ}`);
+        logger.info(`  Lot Size: ${tradingInstrument.lotSize}`);
+        logger.info(`  Tick Size: ${tradingInstrument.tickSize}`);
+        logger.info(`  Multiplier: ${tradingInstrument.multiplier || 'N/A'}`);
+        logger.info(`  Quote Currency: ${tradingInstrument.quoteCurrency || 'N/A'}`);
+        logger.info(`  Maker Fee: ${(tradingInstrument.makerFee || 0) * 100}%`);
+        logger.info(`  Taker Fee: ${(tradingInstrument.takerFee || 0) * 100}%`);
+      }
+    } catch (error) {
+      logger.warn(`Could not pre-fetch instruments: ${error}`);
+      logger.warn('Will fetch instrument details as needed instead');
+    }
+    
     // Initialize the order manager
     const orderManager = new LiveOrderManager(api, stateManager, logger, SYMBOL, DRY_RUN);
     await orderManager.initialize();
@@ -64,6 +87,7 @@ const run = async (): Promise<void> => {
     const handleShutdown = async (signal: string) => {
       logger.warn(`Received ${signal} signal, shutting down...`);
       websocket.close();
+      orderManager.cleanup();
       await stateManager.close();
       process.exit(0);
     };

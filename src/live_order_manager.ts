@@ -1,5 +1,5 @@
-import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId } from './constants';
-import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder } from './types';
+import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL } from './constants';
+import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument } from './types';
 import { StatsLogger } from './logger';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
@@ -14,6 +14,9 @@ export class LiveOrderManager {
   private stateManager: StateManager;
   private symbol: string = 'XBTUSD';
   private isDryRun: boolean = false;
+  private instrumentInfo: BitMEXInstrument | null = null;
+  private syncIntervalId: NodeJS.Timeout | null = null;
+  private processedOrderFills: Set<string> = new Set<string>();
 
   constructor(
     api: BitMEXAPI,
@@ -33,6 +36,25 @@ export class LiveOrderManager {
    * Initialize the live order manager with saved state if available
    */
   async initialize(): Promise<void> {
+    // First, fetch instrument information
+    try {
+      this.instrumentInfo = await this.api.getInstrument(this.symbol);
+      if (this.instrumentInfo) {
+        this.logger.success(`Loaded instrument details for ${this.symbol}: lotSize=${this.instrumentInfo.lotSize}, tickSize=${this.instrumentInfo.tickSize}`);
+      } else {
+        this.logger.error(`Failed to load instrument details for ${this.symbol}`);
+        // If we're not in dry run mode, this is a critical error
+        if (!this.isDryRun) {
+          throw new Error(`Cannot trade without instrument details for ${this.symbol}`);
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error fetching instrument details: ${error}`);
+      if (!this.isDryRun) {
+        throw error;
+      }
+    }
+    
     // Load state
     const state = this.stateManager.getState();
     if (state) {
@@ -55,8 +77,39 @@ export class LiveOrderManager {
     
     // Compare local state with actual BitMEX orders
     await this.syncWithExchangeOrders();
+    
+    // Start periodic sync
+    if (!this.isDryRun) {
+      this.startPeriodicSync();
+    }
   }
 
+  /**
+   * Get instrument lot size
+   */
+  private getLotSize(): number {
+    // Default to 1 if we couldn't get instrument info
+    return this.instrumentInfo?.lotSize || 1;
+  }
+  
+  /**
+   * Calculate contract quantity respecting lot size
+   */
+  private calculateContractQty(btcSize: number, price: number): number {
+    const lotSize = this.getLotSize();
+    
+    // For XBTUSD instruments, 1 contract = 1 USD worth of BTC
+    if (this.symbol.includes('USD') && price > 0) {
+      // Calculate raw contract quantity
+      const rawContractQty = btcSize * price;
+      // Round to nearest lot size
+      return Math.round(rawContractQty / lotSize) * lotSize;
+    }
+    
+    // For other instruments, use BTC size directly but ensure it's a multiple of lot size
+    return Math.round(btcSize / lotSize) * lotSize || lotSize; // Use at least 1 lot size
+  }
+  
   /**
    * Synchronize local order state with BitMEX
    */
@@ -66,6 +119,40 @@ export class LiveOrderManager {
       
       // Get current open orders from the exchange
       const openOrders = await this.api.getOpenOrders(this.symbol);
+      
+      // Also get filled orders from the recent history to detect missed fills
+      // Doing this in a separate try/catch to continue if it fails
+      try {
+        const recentFilledOrders = await this.api.getRecentFilledOrders(this.symbol);
+        
+        if (recentFilledOrders.length > 0) {
+          this.logger.info(`Checking ${recentFilledOrders.length} recently filled orders for missed fills`);
+          
+          // Check for filled orders that we still have in our active orders list
+          for (const filledOrder of recentFilledOrders) {
+            const localOrder = this.activeOrders.find(order => 
+              order.bitmexOrderId === filledOrder.orderID && !order.filled
+            );
+            
+            if (localOrder) {
+              this.logger.warn(`Found filled order ${filledOrder.orderID} (local ID: ${localOrder.id}) that was not detected - processing now`);
+              
+              // Process this fill if not already processed
+              if (!this.processedOrderFills.has(filledOrder.orderID)) {
+                await this.handleOrderFill(
+                  filledOrder.orderID,
+                  filledOrder.price,
+                  filledOrder.side,
+                  filledOrder.orderQty
+                );
+              }
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Failed to check for filled orders: ${error}`);
+        // Continue with open orders sync regardless
+      }
       
       if (openOrders.length > 0) {
         this.logger.success(`Found ${openOrders.length} open orders on BitMEX`);
@@ -77,12 +164,35 @@ export class LiveOrderManager {
           
           // Convert BitMEX orders to our internal format
           const convertedOrders: Order[] = openOrders.map(bitmexOrder => {
+            const side = bitmexOrder.side.toLowerCase() === 'buy' ? 'buy' : 'sell';
+            const contractQty = Math.abs(bitmexOrder.orderQty);
+            
+            // For XBTUSD, convert from contract quantity back to BTC
+            let size: number;
+            if (this.symbol.includes('USD') && bitmexOrder.price > 0) {
+              // For USD instruments, 1 contract = 1 USD worth of BTC
+              // size in BTC = contract quantity / price
+              size = contractQty / bitmexOrder.price;
+            } else {
+              // For other instruments, use the orderQty directly
+              size = contractQty;
+            }
+            
+            // Ensure the contract quantity respects lot size
+            const lotSize = this.getLotSize();
+            if (contractQty % lotSize !== 0) {
+              this.logger.warn(`Order ${bitmexOrder.orderID} has contract quantity ${contractQty} that is not a multiple of lot size ${lotSize}`);
+            }
+            
+            const fee = bitmexOrder.price * size * (FEE_RATE / 100);
+            
             return {
               id: parseInt(bitmexOrder.orderID.slice(-6), 10) || getNextOrderId(),
               price: bitmexOrder.price,
-              size: Math.abs(bitmexOrder.orderQty),
-              side: bitmexOrder.side.toLowerCase() === 'buy' ? 'buy' : 'sell',
-              fee: bitmexOrder.price * Math.abs(bitmexOrder.orderQty) * (FEE_RATE / 100),
+              size: size,
+              contractQty: contractQty,
+              side: side,
+              fee: fee,
               oppositeOrderPrice: null, // We don't know this from exchange data
               filled: false,
               bitmexOrderId: bitmexOrder.orderID // Store the BitMEX order ID
@@ -103,11 +213,57 @@ export class LiveOrderManager {
           this.reconcileOrders(openOrders);
         }
       } else if (this.activeOrders.length > 0) {
-        // We have local orders but no exchange orders - clear local state
-        this.logger.warn('No orders found on exchange but local state has orders - clearing local state');
-        this.activeOrders = [];
-        this.gridInitialized = false;
-        this.stateManager.updateActiveOrders(this.activeOrders);
+        // We have local orders but no exchange orders - check if they were filled
+        this.logger.warn('No open orders found on exchange but local state has orders - checking if they were filled');
+        
+        // Clone the active orders array to avoid modification during iteration
+        const localOrders = [...this.activeOrders];
+        
+        // Check filled orders from exchange history
+        try {
+          const recentFilledOrders = await this.api.getRecentFilledOrders(this.symbol);
+          
+          for (const localOrder of localOrders) {
+            if (localOrder.bitmexOrderId) {
+              // Check if this order was filled
+              const matchingFilledOrder = recentFilledOrders.find(o => 
+                o.orderID === localOrder.bitmexOrderId && o.ordStatus === 'Filled'
+              );
+              
+              if (matchingFilledOrder) {
+                this.logger.warn(`Order #${localOrder.id} (${localOrder.bitmexOrderId}) was filled but not detected - processing now`);
+                
+                // Process this fill if not already processed
+                if (!this.processedOrderFills.has(matchingFilledOrder.orderID)) {
+                  await this.handleOrderFill(
+                    matchingFilledOrder.orderID,
+                    matchingFilledOrder.price,
+                    matchingFilledOrder.side,
+                    matchingFilledOrder.orderQty
+                  );
+                }
+              } else {
+                // Order not found in history - it might have been cancelled or never existed
+                this.logger.warn(`Order #${localOrder.id} (${localOrder.bitmexOrderId}) not found on exchange - removing from local state`);
+                this.activeOrders = this.activeOrders.filter(o => o.id !== localOrder.id);
+              }
+            }
+          }
+          
+          // If we still have local orders after checking, they might be stale
+          if (this.activeOrders.length > 0) {
+            this.logger.warn(`After checking, ${this.activeOrders.length} local orders remain but are not on exchange - clearing them`);
+            this.activeOrders = [];
+          }
+          
+          this.stateManager.updateActiveOrders(this.activeOrders);
+        } catch (error) {
+          this.logger.error(`Failed to check filled orders: ${error}`);
+          // Safest approach is to clear local state if we can't verify
+          this.logger.warn('Clearing local order state due to inability to verify with exchange');
+          this.activeOrders = [];
+          this.stateManager.updateActiveOrders(this.activeOrders);
+        }
       }
       
       // Update logger stats
@@ -135,6 +291,22 @@ export class LiveOrderManager {
       return true;
     });
     
+    // Update contract quantities for FFWCSX instruments
+    if (this.symbol.includes('USD')) {
+      this.activeOrders.forEach(localOrder => {
+        if (localOrder.bitmexOrderId && bitmexOrderMap.has(localOrder.bitmexOrderId)) {
+          const bitmexOrder = bitmexOrderMap.get(localOrder.bitmexOrderId);
+          
+          // Update contract quantity if different from what BitMEX reports
+          if (bitmexOrder && (!localOrder.contractQty || localOrder.contractQty !== bitmexOrder.orderQty)) {
+            const oldQty = localOrder.contractQty || 'undefined';
+            localOrder.contractQty = bitmexOrder.orderQty;
+            this.logger.debug(`Updated contract quantity for order #${localOrder.id}: ${oldQty} -> ${bitmexOrder.orderQty}`);
+          }
+        }
+      });
+    }
+    
     // Update state
     this.stateManager.updateActiveOrders(this.activeOrders);
   }
@@ -154,10 +326,22 @@ export class LiveOrderManager {
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
     const fee = price * size * (FEE_RATE / 100);
+    
+    // Calculate contract quantity for FFWCSX instruments, respecting lot size
+    const contractQty = this.calculateContractQty(size, price);
+    
+    // Adjust BTC size to match the exact contract quantity
+    // This ensures our internal accounting matches what's on the exchange
+    let adjustedSize = size;
+    if (this.symbol.includes('USD') && price > 0) {
+      adjustedSize = contractQty / price;
+    }
+    
     const order: Order = {
       id: getNextOrderId(),
       price,
-      size,
+      size: adjustedSize, // Size in BTC (adjusted to match contract qty)
+      contractQty, // Size in contracts
       side,
       fee,
       oppositeOrderPrice,
@@ -168,14 +352,14 @@ export class LiveOrderManager {
     if (this.isDryRun) {
       this.activeOrders.push(order);
       this.logger.setActiveOrders(this.activeOrders.length);
-      this.logger.info(`[DRY RUN] Created ${side.toUpperCase()} order #${order.id}: ${size} @ $${price.toFixed(2)}, FEE: $${fee.toFixed(4)}`);
+      this.logger.info(`[DRY RUN] Created ${side.toUpperCase()} order #${order.id}: ${adjustedSize.toFixed(8)} BTC (${contractQty} contracts) @ $${price.toFixed(2)}, FEE: $${fee.toFixed(4)}`);
       return order;
     }
     
     // Place order on BitMEX
     try {
       const bitmexSide = side === 'buy' ? 'Buy' : 'Sell';
-      const response = await this.api.placeLimitOrder(bitmexSide, price, size, this.symbol);
+      const response = await this.api.placeLimitOrder(bitmexSide, price, adjustedSize, this.symbol);
       
       // Store BitMEX order ID with our local order
       order.bitmexOrderId = response.orderID;
@@ -183,7 +367,7 @@ export class LiveOrderManager {
       this.activeOrders.push(order);
       this.logger.setActiveOrders(this.activeOrders.length);
       
-      this.logger.success(`Created ${side.toUpperCase()} order #${order.id}: ${size} BTC @ $${price.toFixed(2)}, BitMEX ID: ${order.bitmexOrderId}`);
+      this.logger.success(`Created ${side.toUpperCase()} order #${order.id}: ${adjustedSize.toFixed(8)} BTC (${contractQty} contracts) @ $${price.toFixed(2)}, BitMEX ID: ${order.bitmexOrderId}`);
       
       // Update state
       this.stateManager.updateActiveOrders(this.activeOrders);
@@ -202,8 +386,9 @@ export class LiveOrderManager {
     // Mark the order as filled
     order.filled = true;
     
-    // Log the fill
-    this.logger.success(`Order #${order.id} FILLED: ${order.side.toUpperCase()} ${order.size} BTC @ $${executionPrice.toFixed(2)}`);
+    // Log the fill with contract quantity if available
+    const contractQtyStr = order.contractQty ? ` (${order.contractQty} contracts)` : '';
+    this.logger.success(`Order #${order.id} FILLED: ${order.side.toUpperCase()} ${order.size} BTC${contractQtyStr} @ $${executionPrice.toFixed(2)}`);
     
     // Create a new order on the opposite side if specified
     if (order.oppositeOrderPrice !== null) {
@@ -277,11 +462,21 @@ export class LiveOrderManager {
    * Initialize the ping/pong grid
    */
   async initializeGrid(midPrice: number): Promise<void> {
-    // If running in live mode, cancel any existing orders first
+    // If running in live mode, sync with exchange and cancel any existing orders first
     if (!this.isDryRun) {
       try {
+        // Sync state with exchange to ensure we're working with the latest data
+        await this.syncWithExchangeOrders();
+        
+        // Cancel all orders
         await this.api.cancelAllOrders(this.symbol);
         this.logger.success(`Cancelled all existing orders on ${this.symbol}`);
+        
+        // Wait a moment for cancel operations to process
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Sync again to confirm cancellations
+        await this.syncWithExchangeOrders();
       } catch (error) {
         this.logger.error(`Failed to cancel existing orders: ${error}`);
         // Continue anyway
@@ -432,14 +627,47 @@ export class LiveOrderManager {
    * Handle real fill notification from BitMEX
    */
   async handleOrderFill(orderID: string, executionPrice: number, side: string, orderQty: number): Promise<void> {
+    // Check if we've already processed this order fill
+    if (this.processedOrderFills.has(orderID)) {
+      this.logger.info(`Order ${orderID} fill already processed, skipping duplicate notification`);
+      return;
+    }
+
     // Find the local order that matches this BitMEX order ID
     const matchingOrder = this.activeOrders.find(order => order.bitmexOrderId === orderID);
     
     if (matchingOrder) {
+      // If order is already marked as filled, don't process it again
+      if (matchingOrder.filled) {
+        this.logger.info(`Order ${orderID} (local ID: ${matchingOrder.id}) already marked as filled, skipping`);
+        return;
+      }
+
+      // For FFWCSX instruments like XBTUSD, verify the contract quantity matches
+      if (this.symbol.includes('USD') && matchingOrder.contractQty) {
+        // Log contract quantity for debugging
+        this.logger.debug(`Order ${orderID} fill details: ${orderQty} contracts executed, local order has ${matchingOrder.contractQty} contracts`);
+        
+        // If the contract quantities don't match, update our local order
+        if (matchingOrder.contractQty !== orderQty) {
+          this.logger.warn(`Contract quantity mismatch for order ${orderID}: BitMEX reports ${orderQty}, local state has ${matchingOrder.contractQty}`);
+          matchingOrder.contractQty = orderQty;
+        }
+      }
+      
       this.logger.star(`Received fill notification for order ${orderID} (local ID: ${matchingOrder.id})`);
+      
+      // Mark this order as processed before doing the actual processing
+      // This prevents issues if fillOrder results in state changes that trigger more operations
+      this.processedOrderFills.add(orderID);
+      
       await this.fillOrder(matchingOrder, executionPrice);
     } else {
-      this.logger.warn(`Received fill notification for unknown order ${orderID}`);
+      this.logger.warn(`Received fill notification for unknown order ${orderID} with ${orderQty} contracts`);
+      
+      // Even though we don't know this order, mark it as processed to prevent duplicate processing
+      this.processedOrderFills.add(orderID);
+      
       // Sync with exchange to ensure local state is up to date
       await this.syncWithExchangeOrders();
     }
@@ -477,5 +705,37 @@ export class LiveOrderManager {
       this.logger.info(`[DRY RUN] Simulating market price at $${price.toFixed(2)}`);
       this.simulateInstantFills(price);
     }
+  }
+
+  /**
+   * Start periodic sync with exchange orders
+   */
+  private startPeriodicSync(): void {
+    // Use the constant for sync interval
+    this.logger.info(`Starting periodic order sync every ${ORDER_SYNC_INTERVAL/1000} seconds`);
+    
+    this.syncIntervalId = setInterval(async () => {
+      this.logger.debug('Running periodic order sync with exchange');
+      await this.syncWithExchangeOrders();
+    }, ORDER_SYNC_INTERVAL);
+  }
+  
+  /**
+   * Stop periodic sync
+   */
+  public stopPeriodicSync(): void {
+    if (this.syncIntervalId) {
+      clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+      this.logger.info('Stopped periodic order sync');
+    }
+  }
+  
+  /**
+   * Clean up resources when shutting down
+   */
+  public cleanup(): void {
+    this.stopPeriodicSync();
+    this.logger.info('Order manager resources cleaned up');
   }
 } 
