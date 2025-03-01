@@ -1,8 +1,9 @@
-import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL } from './constants';
+import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL, ENFORCE_ORDER_DISTANCE } from './constants';
 import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument } from './types';
 import { StatsLogger } from './logger';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
+import { MetricsManager } from './metrics_manager';
 
 export class LiveOrderManager {
   private activeOrders: Order[] = [];
@@ -12,6 +13,7 @@ export class LiveOrderManager {
   private logger: StatsLogger;
   private api: BitMEXAPI;
   private stateManager: StateManager;
+  private metricsManager: MetricsManager | null = null;
   private symbol: string = 'XBTUSD';
   private isDryRun: boolean = false;
   private instrumentInfo: BitMEXInstrument | null = null;
@@ -23,13 +25,15 @@ export class LiveOrderManager {
     stateManager: StateManager,
     logger: StatsLogger,
     symbol: string = 'XBTUSD',
-    isDryRun: boolean = false
+    isDryRun: boolean = false,
+    metricsManager: MetricsManager | null = null
   ) {
     this.api = api;
     this.stateManager = stateManager;
     this.logger = logger;
     this.symbol = symbol;
     this.isDryRun = isDryRun;
+    this.metricsManager = metricsManager;
   }
 
   /**
@@ -390,16 +394,47 @@ export class LiveOrderManager {
     const contractQtyStr = order.contractQty ? ` (${order.contractQty} contracts)` : '';
     this.logger.success(`Order #${order.id} FILLED: ${order.side.toUpperCase()} ${order.size} BTC${contractQtyStr} @ $${executionPrice.toFixed(2)}`);
     
-    // Create a new order on the opposite side if specified
-    if (order.oppositeOrderPrice !== null) {
+    // Record order execution metrics
+    if (this.metricsManager) {
+      this.metricsManager.recordOrderExecution(
+        order.id, 
+        order.side, 
+        executionPrice, 
+        order.size, 
+        order.fee
+      );
+      
+      // Record volume metrics
+      this.metricsManager.recordVolume(
+        order.size,
+        executionPrice * order.size,
+        order.side
+      );
+    }
+    
+    // Calculate a new appropriate price based on the execution price
+    // This ensures the new order is placed at the correct distance from where the fill actually happened
+    const newPrice = order.side === 'buy' 
+      ? executionPrice + ORDER_DISTANCE  // For buy fills, place sell ORDER_DISTANCE above execution
+      : executionPrice - ORDER_DISTANCE; // For sell fills, place buy ORDER_DISTANCE below execution
+    
+    // Check if there's any existing unfilled order at or very close to this price
+    const existingOrderAtPrice = this.activeOrders.find(o => 
+      !o.filled && 
+      Math.abs(o.price - newPrice) < (ORDER_DISTANCE * 0.01) // Within 1% of ORDER_DISTANCE
+    );
+    
+    if (existingOrderAtPrice && ENFORCE_ORDER_DISTANCE) {
+      this.logger.warn(`Not placing new order at ${newPrice.toFixed(2)} because there's already an unfilled order nearby (ID: ${existingOrderAtPrice.id})`);
+    } else {
       if (order.side === 'buy') {
         // We filled a buy order, so create a sell order
-        const newOrder = await this.createOrder(order.oppositeOrderPrice, order.size, 'sell', order.price);
+        const newOrder = await this.createOrder(newPrice, order.size, 'sell', null);
         newOrder.entryPrice = executionPrice; // Mark entry price for later profit calculation
         
       } else if (order.side === 'sell') {
         // We filled a sell order, so create a buy order
-        const newOrder = await this.createOrder(order.oppositeOrderPrice, order.size, 'buy', order.price);
+        const newOrder = await this.createOrder(newPrice, order.size, 'buy', null);
         const entryPrice = order.entryPrice;
         
         if (entryPrice) {
@@ -428,6 +463,17 @@ export class LiveOrderManager {
           // Report the trade profit (now passing net profit after fees)
           this.logger.recordTrade(netProfit, totalFees, order.size);
           
+          // Record round-trip trade metrics in InfluxDB
+          if (this.metricsManager) {
+            this.metricsManager.recordTrade(
+              netProfit,
+              totalFees,
+              order.size,
+              entryPrice,
+              executionPrice
+            );
+          }
+          
           // Update state
           this.stateManager.updateCompletedTrades(this.completedTrades);
           this.stateManager.updateStats(
@@ -438,6 +484,17 @@ export class LiveOrderManager {
             this.completedTrades.reduce((total, trade) => total + trade.fees, 0),
             this.completedTrades.reduce((total, trade) => total + trade.entryOrder.size, 0)
           );
+          
+          // Record grid stats metrics
+          if (this.metricsManager) {
+            this.metricsManager.recordGridStats(
+              this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
+              this.completedTrades.length,
+              this.completedTrades.filter(t => t.entryOrder.side === 'buy').length,
+              this.completedTrades.filter(t => t.entryOrder.side === 'sell').length,
+              this.completedTrades.reduce((total, trade) => total + trade.fees, 0)
+            );
+          }
         }
       }
     }
@@ -492,15 +549,15 @@ export class LiveOrderManager {
     // Create buy orders below the mid price
     for (let i = 1; i <= ORDER_COUNT; i++) {
       const buyPrice = midPrice - (i * ORDER_DISTANCE);
-      const sellPrice = midPrice + (i * ORDER_DISTANCE); // Where we'll place a sell if this buy gets filled
-      await this.createOrder(buyPrice, ORDER_SIZE, 'buy', sellPrice);
+      // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
+      await this.createOrder(buyPrice, ORDER_SIZE, 'buy', null);
     }
     
     // Create sell orders above the mid price
     for (let i = 1; i <= ORDER_COUNT; i++) {
       const sellPrice = midPrice + (i * ORDER_DISTANCE);
-      const buyPrice = midPrice - (i * ORDER_DISTANCE); // Where we'll place a buy if this sell gets filled
-      const order = await this.createOrder(sellPrice, ORDER_SIZE, 'sell', buyPrice);
+      // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
+      const order = await this.createOrder(sellPrice, ORDER_SIZE, 'sell', null);
       // For sell orders, set the entry price to the current mid price
       // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
       order.entryPrice = midPrice;

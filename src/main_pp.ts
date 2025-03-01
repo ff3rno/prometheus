@@ -6,6 +6,7 @@ import { LiveOrderManager } from './live_order_manager';
 import { LiveWebSocket } from './live_websocket';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
+import { MetricsManager, MetricsConfig } from './metrics_manager';
 
 // Load environment variables
 dotenv.config();
@@ -16,6 +17,12 @@ const API_SECRET = process.env.BITMEX_API_SECRET || '';
 const SYMBOL = process.env.TRADING_SYMBOL || 'XBTUSD';
 const DRY_RUN = process.env.DRY_RUN === 'true' || !API_KEY || !API_SECRET;
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+
+// InfluxDB configuration
+const INFLUX_HOST = process.env.INFLUX_HOST || '';
+const INFLUX_TOKEN = process.env.INFLUX_TOKEN || '';
+const INFLUX_DATABASE = process.env.INFLUX_DATABASE || 'prometheus_grid';
+const INFLUX_ENABLED = process.env.INFLUX_ENABLED === 'true' && !!INFLUX_HOST;
 
 // Create a logger instance
 const logger = new StatsLogger('pp-live');
@@ -43,6 +50,24 @@ const run = async (): Promise<void> => {
       }
     } else {
       logger.star('LIVE TRADING MODE ACTIVATED - REAL ORDERS WILL BE PLACED');
+    }
+
+    // InfluxDB metrics configuration
+    const metricsConfig: MetricsConfig = {
+      host: INFLUX_HOST,
+      token: INFLUX_TOKEN,
+      database: INFLUX_DATABASE,
+      enabled: INFLUX_ENABLED
+    };
+
+    // Initialize metrics manager
+    let metricsManager: MetricsManager | null = null;
+    
+    if (INFLUX_ENABLED) {
+      logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})`);
+      metricsManager = new MetricsManager(logger, metricsConfig, SYMBOL);
+    } else {
+      logger.warn('InfluxDB metrics disabled');
     }
     
     // Initialize state manager
@@ -77,7 +102,7 @@ const run = async (): Promise<void> => {
     }
     
     // Initialize the order manager
-    const orderManager = new LiveOrderManager(api, stateManager, logger, SYMBOL, DRY_RUN);
+    const orderManager = new LiveOrderManager(api, stateManager, logger, SYMBOL, DRY_RUN, metricsManager);
     await orderManager.initialize();
     
     // Initialize the WebSocket connection
@@ -88,6 +113,9 @@ const run = async (): Promise<void> => {
       logger.warn(`Received ${signal} signal, shutting down...`);
       websocket.close();
       orderManager.cleanup();
+      if (metricsManager) {
+        metricsManager.close();
+      }
       await stateManager.close();
       process.exit(0);
     };

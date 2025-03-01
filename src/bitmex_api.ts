@@ -1,6 +1,7 @@
 import axios, { AxiosRequestConfig } from 'axios';
 import * as crypto from 'crypto';
 import { URL } from 'url';
+import Bottleneck from 'bottleneck';
 import { Order, BitMEXOrder, BitMEXPosition, BitMEXInstrument } from './types';
 import { StatsLogger } from './logger';
 
@@ -11,6 +12,12 @@ export class BitMEXAPI {
   private testnet: boolean;
   private baseUrl: string;
   private instrumentCache: Map<string, BitMEXInstrument> = new Map();
+  
+  // Main limiter: 120 requests per minute (2 per second)
+  private mainLimiter: Bottleneck;
+  
+  // Order-specific limiter: 10 requests per second
+  private orderLimiter: Bottleneck;
 
   constructor(apiKey: string, apiSecret: string, logger: StatsLogger, testnet: boolean = false) {
     this.apiKey = apiKey;
@@ -18,6 +25,89 @@ export class BitMEXAPI {
     this.logger = logger;
     this.testnet = testnet;
     this.baseUrl = testnet ? 'https://testnet.bitmex.com' : 'https://www.bitmex.com';
+    
+    // Initialize rate limiters
+    this.mainLimiter = new Bottleneck({
+      reservoir: 120, // 120 requests
+      reservoirRefreshAmount: 120,
+      reservoirRefreshInterval: 60 * 1000, // 1 minute
+      maxConcurrent: 10, // Maximum concurrent requests
+      minTime: 50 // Minimum time between requests (ms)
+    });
+    
+    this.orderLimiter = new Bottleneck({
+      reservoir: 10, // 10 requests
+      reservoirRefreshAmount: 10,
+      reservoirRefreshInterval: 1000, // 1 second
+      maxConcurrent: 5, // Maximum concurrent requests
+      minTime: 100 // Minimum time between requests (ms)
+    });
+    
+    // Set up limiter events for logging
+    this.setupLimiterEvents();
+  }
+
+  /**
+   * Set up event handlers for rate limiters
+   */
+  private setupLimiterEvents(): void {
+    // Main limiter events
+    this.mainLimiter.on('depleted', () => {
+      this.logger.warn('Main rate limit reached - throttling requests');
+    });
+    
+    this.mainLimiter.on('error', (error) => {
+      this.logger.error(`Main limiter error: ${error}`);
+    });
+    
+    // Order limiter events
+    this.orderLimiter.on('depleted', () => {
+      this.logger.warn('Order rate limit reached - throttling order requests');
+    });
+    
+    this.orderLimiter.on('error', (error) => {
+      this.logger.error(`Order limiter error: ${error}`);
+    });
+  }
+
+  /**
+   * Update rate limiters based on response headers
+   */
+  private updateRateLimits(headers: Record<string, any>): void {
+    // Update main rate limiter based on headers
+    if (headers['x-ratelimit-remaining'] && headers['x-ratelimit-limit']) {
+      const remaining = parseInt(String(headers['x-ratelimit-remaining']), 10);
+      const limit = parseInt(String(headers['x-ratelimit-limit']), 10);
+      
+      if (!isNaN(remaining) && !isNaN(limit)) {
+        this.mainLimiter.updateSettings({ 
+          reservoir: remaining,
+          reservoirRefreshAmount: limit,
+          reservoirRefreshInterval: 60 * 1000 // 1 minute
+        });
+      }
+    }
+    
+    // Update order rate limiter based on headers
+    if (headers['x-ratelimit-remaining-1s']) {
+      const remaining1s = parseInt(String(headers['x-ratelimit-remaining-1s']), 10);
+      
+      if (!isNaN(remaining1s)) {
+        this.orderLimiter.updateSettings({ 
+          reservoir: remaining1s,
+          reservoirRefreshAmount: 10,
+          reservoirRefreshInterval: 1000 // 1 second
+        });
+      }
+    }
+    
+    // Handle retry-after header for rate limiting
+    if (headers['retry-after']) {
+      const retryAfter = parseInt(String(headers['retry-after']), 10);
+      if (!isNaN(retryAfter)) {
+        this.logger.warn(`Rate limited - retry after ${retryAfter} seconds`);
+      }
+    }
   }
 
   /**
@@ -37,7 +127,31 @@ export class BitMEXAPI {
   }
 
   /**
-   * Makes a request to the BitMEX API
+   * Determines if a request should use the order-specific rate limiter
+   */
+  private isOrderEndpoint(endpoint: string, method: string): boolean {
+    const orderEndpoints = [
+      '/api/v1/order',
+      '/api/v1/order/all',
+      '/api/v1/position/isolate',
+      '/api/v1/position/leverage',
+      '/api/v1/position/transferMargin'
+    ];
+    
+    // Check if the endpoint is in the list of order endpoints
+    const isOrderPath = orderEndpoints.some(path => endpoint.startsWith(path));
+    
+    // For /api/v1/order, only POST, PUT, DELETE methods are limited
+    if (endpoint.startsWith('/api/v1/order') && !endpoint.includes('/all')) {
+      return ['POST', 'PUT', 'DELETE'].includes(method);
+    }
+    
+    // For other order endpoints
+    return isOrderPath;
+  }
+
+  /**
+   * Makes a request to the BitMEX API with rate limiting
    */
   private async makeRequest(
     method: string,
@@ -77,11 +191,42 @@ export class BitMEXAPI {
       config.data = data;
     }
     
+    // Determine which limiter to use
+    const isOrderRequest = this.isOrderEndpoint(endpoint, method);
+    const limiter = isOrderRequest ? this.orderLimiter : this.mainLimiter;
+    
+    // Log which limiter we're using
+    this.logger.debug(`Using ${isOrderRequest ? 'order' : 'main'} rate limiter for ${method} ${endpoint}`);
+    
     try {
-      const response = await axios(config);
+      // Schedule the request through the appropriate limiter
+      const response = await limiter.schedule(() => axios(config));
+      
+      // Update rate limits based on response headers
+      this.updateRateLimits(response.headers);
+      
       return response.data;
     } catch (error) {
       if (axios.isAxiosError(error) && error.response) {
+        // Handle rate limit errors (429)
+        if (error.response.status === 429) {
+          const retryAfter = error.response.headers['retry-after'];
+          this.logger.error(`Rate limit exceeded (429). Retry after: ${retryAfter} seconds`);
+          
+          // Update rate limits based on response headers
+          this.updateRateLimits(error.response.headers);
+          
+          // If retry-after header is present, wait and retry
+          if (retryAfter) {
+            const retryMs = parseInt(String(retryAfter), 10) * 1000;
+            this.logger.info(`Waiting ${retryAfter} seconds before retrying...`);
+            await new Promise(resolve => setTimeout(resolve, retryMs));
+            
+            // Retry the request
+            return this.makeRequest(method, endpoint, data);
+          }
+        }
+        
         this.logger.error(`API Error ${error.response.status}: ${JSON.stringify(error.response.data)}`);
       } else {
         this.logger.error(`API Error: ${error}`);
