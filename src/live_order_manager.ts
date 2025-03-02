@@ -64,6 +64,9 @@ export class LiveOrderManager {
     downwardGridSpacing: ORDER_DISTANCE
   };
   private candles: Candle[] = [];
+  private _isInitializingGrid: boolean = false;
+  private lastGridInitTimestamp: number = 0;
+  private readonly GRID_INIT_THROTTLE_MS: number = 5000; // Minimum time between grid initializations
 
   constructor(
     api: BitMEXAPI,
@@ -648,96 +651,109 @@ export class LiveOrderManager {
    * Initialize the ping/pong grid
    */
   async initializeGrid(midPrice: number): Promise<void> {
-    // If running in live mode, sync with exchange and cancel any existing orders first
-    if (!this.isDryRun) {
-      try {
-        // Sync state with exchange to ensure we're working with the latest data
-        await this.syncWithExchangeOrders();
-        
-        // Cancel all orders
-        await this.api.cancelAllOrders(this.symbol);
-        this.logger.success(`Cancelled all existing orders on ${this.symbol}`);
-        
-        // Wait a moment for cancel operations to process
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Sync again to confirm cancellations
-        await this.syncWithExchangeOrders();
-      } catch (error) {
-        this.logger.error(`Failed to cancel existing orders: ${error}`);
-        // Continue anyway
-      }
+    // Prevent duplicate initializations happening in close succession
+    if (this._isInitializingGrid) {
+      this.logger.warn('Grid initialization already in progress, ignoring duplicate call');
+      return;
     }
-    
-    // Clear any existing orders
-    this.activeOrders = [];
-    
-    // Ensure the reference price is rounded to tick size
-    this.referencePrice = this.roundPriceToTickSize(midPrice);
-    
-    // Get upward and downward grid spacing
-    const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
-    const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
-    
-    // Log grid initialization with asymmetric spacing if applicable
-    if (upwardGridSpacing !== downwardGridSpacing) {
-      this.logger.star(`Initializing ASYMMETRIC grid at $${this.referencePrice.toFixed(2)}, UP spacing: $${upwardGridSpacing.toFixed(2)}, DOWN spacing: $${downwardGridSpacing.toFixed(2)}`);
+
+    this._isInitializingGrid = true;
+
+    try {
+      // If running in live mode, sync with exchange and cancel any existing orders first
+      if (!this.isDryRun) {
+        try {
+          // Sync state with exchange to ensure we're working with the latest data
+          await this.syncWithExchangeOrders();
+          
+          // Cancel all orders
+          await this.api.cancelAllOrders(this.symbol);
+          this.logger.success(`Cancelled all existing orders on ${this.symbol}`);
+          
+          // Wait a moment for cancel operations to process
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          
+          // Sync again to confirm cancellations
+          await this.syncWithExchangeOrders();
+        } catch (error) {
+          this.logger.error(`Failed to cancel existing orders: ${error}`);
+          // Continue anyway
+        }
+      }
       
-      // Log trend information if available
-      if (this.gridSizing.trendDirection) {
-        this.logger.info(`Grid spacing asymmetry based on ${this.gridSizing.trendDirection} trend (strength: ${(this.gridSizing.trendStrength || 0).toFixed(2)})`);
+      // Clear any existing orders
+      this.activeOrders = [];
+      
+      // Ensure the reference price is rounded to tick size
+      this.referencePrice = this.roundPriceToTickSize(midPrice);
+      
+      // Get upward and downward grid spacing
+      const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
+      const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+      
+      // Log grid initialization with asymmetric spacing if applicable
+      if (upwardGridSpacing !== downwardGridSpacing) {
+        this.logger.star(`Initializing ASYMMETRIC grid at $${this.referencePrice.toFixed(2)}, UP spacing: $${upwardGridSpacing.toFixed(2)}, DOWN spacing: $${downwardGridSpacing.toFixed(2)}`);
+        
+        // Log trend information if available
+        if (this.gridSizing.trendDirection) {
+          this.logger.info(`Grid spacing asymmetry based on ${this.gridSizing.trendDirection} trend (strength: ${(this.gridSizing.trendStrength || 0).toFixed(2)})`);
+        }
+      } else {
+        this.logger.star(`Initializing SYMMETRIC grid at $${this.referencePrice.toFixed(2)}, grid spacing: $${upwardGridSpacing.toFixed(2)}`);
       }
-    } else {
-      this.logger.star(`Initializing SYMMETRIC grid at $${this.referencePrice.toFixed(2)}, grid spacing: $${upwardGridSpacing.toFixed(2)}`);
-    }
-    
-    if (this.gridSizing.useATR && this.gridSizing.lastATRValue > 0) {
-      this.logger.info(`Using ATR-based grid sizing: ATR=${this.gridSizing.lastATRValue.toFixed(2)}, multiplier=${ATR_MULTIPLIER}`);
-    }
-    
-    // Create buy orders below the mid price with asymmetric spacing
-    let currentBuyPrice = this.referencePrice;
-    for (let i = 1; i <= ORDER_COUNT; i++) {
-      currentBuyPrice -= downwardGridSpacing;
-      // Round the buy price to the instrument's tick size
-      const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
-      // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-      await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
-    }
-    
-    // Create sell orders above the mid price with asymmetric spacing
-    let currentSellPrice = this.referencePrice;
-    for (let i = 1; i <= ORDER_COUNT; i++) {
-      currentSellPrice += upwardGridSpacing;
-      // Round the sell price to the instrument's tick size
-      const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
-      // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-      const order = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
-      // For sell orders, set the entry price to the current mid price
-      // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
-      order.entryPrice = this.referencePrice;
-    }
-    
-    // Calculate the total grid cost (capital required)
-    let totalGridCost = 0;
-    this.activeOrders.forEach(order => {
-      if (order.side === 'buy') {
-        const orderCost = order.price * order.size;
-        totalGridCost += orderCost;
+      
+      if (this.gridSizing.useATR && this.gridSizing.lastATRValue > 0) {
+        this.logger.info(`Using ATR-based grid sizing: ATR=${this.gridSizing.lastATRValue.toFixed(2)}, multiplier=${ATR_MULTIPLIER}`);
       }
-    });
-    
-    this.gridInitialized = true;
-    this.logger.setStatus(`GRID ACTIVE (${this.activeOrders.length} orders)`);
-    this.logger.success(`Grid initialized with ${this.activeOrders.length} orders (${ORDER_COUNT} buys, ${ORDER_COUNT} sells)`);
-    this.logger.star(`Total grid cost: $${totalGridCost.toFixed(2)} (capital required)`);
-    
-    // Update state
-    this.stateManager.updateActiveOrders(this.activeOrders);
-    this.stateManager.updateReferencePrice(this.referencePrice);
-    
-    // Simulate instant fills for orders that would execute at the current price
-    this.simulateInstantFills(midPrice);
+      
+      // Create buy orders below the mid price with asymmetric spacing
+      let currentBuyPrice = this.referencePrice;
+      for (let i = 1; i <= ORDER_COUNT; i++) {
+        currentBuyPrice -= downwardGridSpacing;
+        // Round the buy price to the instrument's tick size
+        const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
+        // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
+        await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
+      }
+      
+      // Create sell orders above the mid price with asymmetric spacing
+      let currentSellPrice = this.referencePrice;
+      for (let i = 1; i <= ORDER_COUNT; i++) {
+        currentSellPrice += upwardGridSpacing;
+        // Round the sell price to the instrument's tick size
+        const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
+        // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
+        const order = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
+        // For sell orders, set the entry price to the current mid price
+        // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
+        order.entryPrice = this.referencePrice;
+      }
+      
+      // Calculate the total grid cost (capital required)
+      let totalGridCost = 0;
+      this.activeOrders.forEach(order => {
+        if (order.side === 'buy') {
+          const orderCost = order.price * order.size;
+          totalGridCost += orderCost;
+        }
+      });
+      
+      this.gridInitialized = true;
+      this.logger.setStatus(`GRID ACTIVE (${this.activeOrders.length} orders)`);
+      this.logger.success(`Grid initialized with ${this.activeOrders.length} orders (${ORDER_COUNT} buys, ${ORDER_COUNT} sells)`);
+      this.logger.star(`Total grid cost: $${totalGridCost.toFixed(2)} (capital required)`);
+      
+      // Update state
+      this.stateManager.updateActiveOrders(this.activeOrders);
+      this.stateManager.updateReferencePrice(this.referencePrice);
+      
+      // Simulate instant fills for orders that would execute at the current price
+      this.simulateInstantFills(midPrice);
+    } finally {
+      // Release the initialization lock
+      this._isInitializingGrid = false;
+    }
   }
 
   /**
@@ -819,16 +835,22 @@ export class LiveOrderManager {
     // Basic trade info with closest order distance
     this.logger.debug(`MARKET TRADE: ${trade.side} ${trade.size} @ $${trade.price} (${closestDistance.toFixed(2)} from closest grid order)`);
     
+    const currentTime = Date.now();
+    const timeSinceLastInit = currentTime - this.lastGridInitTimestamp;
+
     // Check if price has moved significantly from reference price
     if (this.gridInitialized && this.referencePrice > 0 && 
-        Math.abs(trade.price - this.referencePrice) > ORDER_DISTANCE * ORDER_COUNT) {
+        Math.abs(trade.price - this.referencePrice) > ORDER_DISTANCE * ORDER_COUNT &&
+        timeSinceLastInit > this.GRID_INIT_THROTTLE_MS) {
       this.logger.warn(`Price moved significantly from reference: $${this.referencePrice.toFixed(2)} -> $${trade.price.toFixed(2)}`);
       this.logger.warn(`Re-initializing grid at new price level`);
+      this.lastGridInitTimestamp = currentTime;
       this.initializeGrid(trade.price);
     }
     
-    // Initialize grid if not already initialized
-    if (!this.gridInitialized) {
+    // Initialize grid if not already initialized and not too soon after the last initialization
+    if (!this.gridInitialized && timeSinceLastInit > this.GRID_INIT_THROTTLE_MS) {
+      this.lastGridInitTimestamp = currentTime;
       this.initializeGrid(trade.price);
     } else {
       // In dry run mode, check if any of our orders would be filled by this trade
@@ -911,7 +933,11 @@ export class LiveOrderManager {
       return;
     }
     
-    if (!this.gridInitialized) {
+    const currentTime = Date.now();
+    const timeSinceLastInit = currentTime - this.lastGridInitTimestamp;
+    
+    if (!this.gridInitialized && timeSinceLastInit > this.GRID_INIT_THROTTLE_MS) {
+      this.lastGridInitTimestamp = currentTime;
       this.initializeGrid(price);
     } else {
       this.logger.info(`[DRY RUN] Simulating market price at $${price.toFixed(2)}`);
