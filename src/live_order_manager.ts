@@ -1,15 +1,17 @@
-import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL, ENFORCE_ORDER_DISTANCE } from './constants';
-import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument } from './types';
+import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL, ENFORCE_ORDER_DISTANCE, ATR_PERIOD, ATR_MULTIPLIER, ATR_MINIMUM_GRID_DISTANCE, ATR_MAXIMUM_GRID_DISTANCE, ATR_RECALCULATION_INTERVAL, ATR_HISTORICAL_TRADES_LOOKBACK } from './constants';
+import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument, Candle, GridSizingConfig } from './types';
 import { StatsLogger } from './logger';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
 import { MetricsManager } from './metrics_manager';
+import { ATR } from 'bfx-hf-indicators';
 
 export class LiveOrderManager {
   private activeOrders: Order[] = [];
   private completedTrades: CompletedTrade[] = [];
   private gridInitialized: boolean = false;
   private referencePrice: number = 0;
+  private currentMarketPrice: number = 0;
   private logger: StatsLogger;
   private api: BitMEXAPI;
   private stateManager: StateManager;
@@ -19,6 +21,15 @@ export class LiveOrderManager {
   private instrumentInfo: BitMEXInstrument | null = null;
   private syncIntervalId: NodeJS.Timeout | null = null;
   private processedOrderFills: Set<string> = new Set<string>();
+  private atrRecalculationIntervalId: NodeJS.Timeout | null = null;
+  private atrInstance: any; // bfx-hf-indicators ATR instance
+  private gridSizing: GridSizingConfig = {
+    useATR: true,
+    currentDistance: ORDER_DISTANCE,
+    lastATRValue: 0,
+    lastRecalculation: 0
+  };
+  private candles: Candle[] = [];
 
   constructor(
     api: BitMEXAPI,
@@ -59,12 +70,21 @@ export class LiveOrderManager {
       }
     }
     
+    // Initialize ATR indicator
+    this.atrInstance = new ATR([ATR_PERIOD]);
+    
     // Load state
     const state = this.stateManager.getState();
     if (state) {
       this.activeOrders = state.activeOrders || [];
       this.completedTrades = state.completedTrades || [];
       this.referencePrice = state.referencePrice || 0;
+      
+      // Load grid sizing config if available
+      if (state.gridSizing) {
+        this.gridSizing = state.gridSizing;
+        this.logger.info(`Loaded grid sizing configuration: distance=${this.gridSizing.currentDistance}, lastATR=${this.gridSizing.lastATRValue}`);
+      }
       
       if (this.activeOrders.length > 0) {
         this.gridInitialized = true;
@@ -86,6 +106,12 @@ export class LiveOrderManager {
     if (!this.isDryRun) {
       this.startPeriodicSync();
     }
+    
+    // Initially fetch and calculate ATR
+    await this.calculateATRAndUpdateGridSpacing();
+    
+    // Start ATR recalculation interval
+    this.startATRRecalculationInterval();
   }
 
   /**
@@ -412,89 +438,93 @@ export class LiveOrderManager {
       );
     }
     
+    // Get current grid distance (either ATR-based or constant)
+    const gridDistance = this.getGridDistance();
+    
     // Calculate a new appropriate price based on the execution price
     // This ensures the new order is placed at the correct distance from where the fill actually happened
     const newPrice = order.side === 'buy' 
-      ? executionPrice + ORDER_DISTANCE  // For buy fills, place sell ORDER_DISTANCE above execution
-      : executionPrice - ORDER_DISTANCE; // For sell fills, place buy ORDER_DISTANCE below execution
+      ? executionPrice + gridDistance  // For buy fills, place sell gridDistance above execution
+      : executionPrice - gridDistance; // For sell fills, place buy gridDistance below execution
     
     // Check if there's any existing unfilled order at or very close to this price
     const existingOrderAtPrice = this.activeOrders.find(o => 
       !o.filled && 
-      Math.abs(o.price - newPrice) < (ORDER_DISTANCE * 0.01) // Within 1% of ORDER_DISTANCE
+      Math.abs(o.price - newPrice) < (gridDistance * 0.01) // Within 1% of gridDistance
     );
     
+    // Always place a new order, but log if there's already one nearby
     if (existingOrderAtPrice && ENFORCE_ORDER_DISTANCE) {
-      this.logger.warn(`Not placing new order at ${newPrice.toFixed(2)} because there's already an unfilled order nearby (ID: ${existingOrderAtPrice.id})`);
-    } else {
-      if (order.side === 'buy') {
-        // We filled a buy order, so create a sell order
-        const newOrder = await this.createOrder(newPrice, order.size, 'sell', null);
-        newOrder.entryPrice = executionPrice; // Mark entry price for later profit calculation
+      this.logger.warn(`Placing new order at ${newPrice.toFixed(2)} despite nearby order (ID: ${existingOrderAtPrice.id}) - ENFORCE_ORDER_DISTANCE is ${ENFORCE_ORDER_DISTANCE}`);
+    }
+    
+    if (order.side === 'buy') {
+      // We filled a buy order, so create a sell order
+      const newOrder = await this.createOrder(newPrice, order.size, 'sell', null);
+      newOrder.entryPrice = executionPrice; // Mark entry price for later profit calculation
+      
+    } else if (order.side === 'sell') {
+      // We filled a sell order, so create a buy order
+      const newOrder = await this.createOrder(newPrice, order.size, 'buy', null);
+      const entryPrice = order.entryPrice;
+      
+      if (entryPrice) {
+        // Calculate profit from selling higher than entry
+        const grossProfit = (executionPrice - entryPrice) * order.size;
+        const totalFees = order.fee + newOrder.fee;
+        const netProfit = grossProfit - totalFees;
         
-      } else if (order.side === 'sell') {
-        // We filled a sell order, so create a buy order
-        const newOrder = await this.createOrder(newPrice, order.size, 'buy', null);
-        const entryPrice = order.entryPrice;
+        // Record the completed trade
+        this.completedTrades.push({
+          entryOrder: {
+            ...order,
+            price: entryPrice,
+            side: 'buy' // Treat the entry as a buy for simplicity in tracking
+          } as Order,
+          exitOrder: {
+            ...order,
+            price: executionPrice
+          } as Order,
+          profit: netProfit,
+          fees: totalFees
+        });
         
-        if (entryPrice) {
-          // Calculate profit from selling higher than entry
-          const grossProfit = (executionPrice - entryPrice) * order.size;
-          const totalFees = order.fee + newOrder.fee;
-          const netProfit = grossProfit - totalFees;
-          
-          // Record the completed trade
-          this.completedTrades.push({
-            entryOrder: {
-              ...order,
-              price: entryPrice,
-              side: 'buy' // Treat the entry as a buy for simplicity in tracking
-            } as Order,
-            exitOrder: {
-              ...order,
-              price: executionPrice
-            } as Order,
-            profit: netProfit,
-            fees: totalFees
-          });
-          
-          this.logger.star(`Trade complete: ENTRY @ $${entryPrice.toFixed(2)} → EXIT @ $${executionPrice.toFixed(2)} | Net P/L: $${netProfit.toFixed(2)}`);
-          
-          // Report the trade profit (now passing net profit after fees)
-          this.logger.recordTrade(netProfit, totalFees, order.size);
-          
-          // Record round-trip trade metrics in InfluxDB
-          if (this.metricsManager) {
-            this.metricsManager.recordTrade(
-              netProfit,
-              totalFees,
-              order.size,
-              entryPrice,
-              executionPrice
-            );
-          }
-          
-          // Update state
-          this.stateManager.updateCompletedTrades(this.completedTrades);
-          this.stateManager.updateStats(
+        this.logger.star(`Trade complete: ENTRY @ $${entryPrice.toFixed(2)} → EXIT @ $${executionPrice.toFixed(2)} | Net P/L: $${netProfit.toFixed(2)}`);
+        
+        // Report the trade profit (now passing net profit after fees)
+        this.logger.recordTrade(netProfit, totalFees, order.size);
+        
+        // Record round-trip trade metrics in InfluxDB
+        if (this.metricsManager) {
+          this.metricsManager.recordTrade(
+            netProfit,
+            totalFees,
+            order.size,
+            entryPrice,
+            executionPrice
+          );
+        }
+        
+        // Update state
+        this.stateManager.updateCompletedTrades(this.completedTrades);
+        this.stateManager.updateStats(
+          this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
+          this.completedTrades.length,
+          this.completedTrades.filter(t => t.profit > 0).length,
+          this.completedTrades.filter(t => t.profit < 0).length,
+          this.completedTrades.reduce((total, trade) => total + trade.fees, 0),
+          this.completedTrades.reduce((total, trade) => total + trade.entryOrder.size, 0)
+        );
+        
+        // Record grid stats metrics
+        if (this.metricsManager) {
+          this.metricsManager.recordGridStats(
             this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
             this.completedTrades.length,
-            this.completedTrades.filter(t => t.profit > 0).length,
-            this.completedTrades.filter(t => t.profit < 0).length,
-            this.completedTrades.reduce((total, trade) => total + trade.fees, 0),
-            this.completedTrades.reduce((total, trade) => total + trade.entryOrder.size, 0)
+            this.completedTrades.filter(t => t.entryOrder.side === 'buy').length,
+            this.completedTrades.filter(t => t.entryOrder.side === 'sell').length,
+            this.completedTrades.reduce((total, trade) => total + trade.fees, 0)
           );
-          
-          // Record grid stats metrics
-          if (this.metricsManager) {
-            this.metricsManager.recordGridStats(
-              this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
-              this.completedTrades.length,
-              this.completedTrades.filter(t => t.entryOrder.side === 'buy').length,
-              this.completedTrades.filter(t => t.entryOrder.side === 'sell').length,
-              this.completedTrades.reduce((total, trade) => total + trade.fees, 0)
-            );
-          }
         }
       }
     }
@@ -544,18 +574,25 @@ export class LiveOrderManager {
     this.activeOrders = [];
     
     this.referencePrice = midPrice;
-    this.logger.star(`Initializing grid with reference price: $${midPrice.toFixed(2)}`);
+    
+    // Get current grid distance (either ATR-based or constant)
+    const gridDistance = this.getGridDistance();
+    this.logger.star(`Initializing grid with reference price: $${midPrice.toFixed(2)}, grid spacing: $${gridDistance.toFixed(2)}`);
+    
+    if (this.gridSizing.useATR && this.gridSizing.lastATRValue > 0) {
+      this.logger.info(`Using ATR-based grid sizing: ATR=${this.gridSizing.lastATRValue.toFixed(2)}, multiplier=${ATR_MULTIPLIER}`);
+    }
     
     // Create buy orders below the mid price
     for (let i = 1; i <= ORDER_COUNT; i++) {
-      const buyPrice = midPrice - (i * ORDER_DISTANCE);
+      const buyPrice = midPrice - (i * gridDistance);
       // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
       await this.createOrder(buyPrice, ORDER_SIZE, 'buy', null);
     }
     
     // Create sell orders above the mid price
     for (let i = 1; i <= ORDER_COUNT; i++) {
-      const sellPrice = midPrice + (i * ORDER_DISTANCE);
+      const sellPrice = midPrice + (i * gridDistance);
       // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
       const order = await this.createOrder(sellPrice, ORDER_SIZE, 'sell', null);
       // For sell orders, set the entry price to the current mid price
@@ -649,6 +686,9 @@ export class LiveOrderManager {
    * Process market trades
    */
   processTrade(trade: BitMEXTrade): void {
+    // Update current market price
+    this.currentMarketPrice = trade.price;
+    
     // Calculate distance to closest grid order
     let closestDistance = Number.MAX_VALUE;
     
@@ -774,6 +814,9 @@ export class LiveOrderManager {
     this.syncIntervalId = setInterval(async () => {
       this.logger.debug('Running periodic order sync with exchange');
       await this.syncWithExchangeOrders();
+      
+      // Check and fill grid gaps after syncing with exchange
+      await this.checkAndFillGridGaps();
     }, ORDER_SYNC_INTERVAL);
   }
   
@@ -789,10 +832,341 @@ export class LiveOrderManager {
   }
   
   /**
+   * Check for gaps in the grid and fill them with new orders
+   */
+  private async checkAndFillGridGaps(): Promise<void> {
+    if (!this.gridInitialized || this.activeOrders.length < 2) {
+      return; // Not enough orders to check for gaps
+    }
+    
+    try {
+      // Check if we have a valid current market price
+      if (this.currentMarketPrice <= 0) {
+        this.logger.warn('Cannot check for grid gaps: No valid market price available');
+        return;
+      }
+      
+      // Sort orders by price (ascending)
+      const sortedOrders = [...this.activeOrders]
+        .filter(order => !order.filled)
+        .sort((a, b) => a.price - b.price);
+      
+      // Separate buy and sell orders
+      const buyOrders = sortedOrders.filter(order => order.side === 'buy');
+      const sellOrders = sortedOrders.filter(order => order.side === 'sell');
+      
+      // Exit if we don't have both buy and sell orders
+      if (buyOrders.length === 0 || sellOrders.length === 0) {
+        this.logger.debug(`Cannot check for grid gaps: ${buyOrders.length} buy orders, ${sellOrders.length} sell orders`);
+        return;
+      }
+      
+      // Find the highest buy order and lowest sell order
+      const highestBuy = buyOrders[buyOrders.length - 1].price;
+      const lowestSell = sellOrders[0].price;
+      
+      // Get current grid distance
+      const gridDistance = this.getGridDistance();
+      
+      // Log current grid state for debugging
+      this.logger.debug(`Grid state: ${buyOrders.length} buy orders (highest: ${highestBuy.toFixed(2)}), ${sellOrders.length} sell orders (lowest: ${lowestSell.toFixed(2)})`);
+      
+      // Threshold for gap detection (1.5x normal distance to account for some flexibility)
+      const maxAllowedGap = gridDistance * 1.5;
+      
+      // Check if there's a large gap between highest buy and lowest sell
+      if (lowestSell - highestBuy > maxAllowedGap) {
+        this.logger.warn(`Detected large gap between highest buy (${highestBuy.toFixed(2)}) and lowest sell (${lowestSell.toFixed(2)})`);
+        
+        // Calculate the middle of the gap where we'll place new orders
+        const gapMiddle = (highestBuy + lowestSell) / 2;
+        
+        // Calculate how many orders we can fit in the gap
+        const gapSize = lowestSell - highestBuy;
+        const possibleOrderCount = Math.floor(gapSize / gridDistance) - 1;
+        
+        if (possibleOrderCount > 0) {
+          this.logger.info(`Filling gap with ${possibleOrderCount} orders`);
+          
+          // Place orders to fill the gap
+          for (let i = 1; i <= possibleOrderCount; i++) {
+            const ratio = i / (possibleOrderCount + 1);
+            const price = highestBuy + (gapSize * ratio);
+            
+            // Determine order side based on position relative to the reference price
+            const side = price < this.referencePrice ? 'buy' : 'sell';
+            
+            // Skip this order if it would execute immediately against the market
+            if ((side === 'buy' && price >= this.currentMarketPrice) || 
+                (side === 'sell' && price <= this.currentMarketPrice)) {
+              this.logger.warn(`Skipping gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+              continue;
+            }
+            
+            try {
+              const order = await this.createOrder(price, ORDER_SIZE, side, null);
+              if (side === 'sell') {
+                order.entryPrice = this.referencePrice;
+              }
+              this.logger.success(`Placed gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)}`);
+              
+              // Sleep briefly between order placements to avoid rate limits
+              if (i < possibleOrderCount) {
+                await new Promise(resolve => setTimeout(resolve, 200));
+              }
+            } catch (error) {
+              this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
+              // Continue with next order rather than stopping the entire process
+            }
+          }
+        }
+      }
+      
+      // Check for gaps between consecutive buy orders
+      for (let i = 0; i < buyOrders.length - 1; i++) {
+        const currentPrice = buyOrders[i].price;
+        const nextPrice = buyOrders[i + 1].price;
+        const gap = nextPrice - currentPrice;
+        
+        if (gap > maxAllowedGap) {
+          this.logger.warn(`Detected gap between buy orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
+          
+          // Calculate number of orders to insert
+          const ordersToInsert = Math.floor(gap / gridDistance) - 1;
+          
+          if (ordersToInsert > 0) {
+            for (let j = 1; j <= ordersToInsert; j++) {
+              const price = currentPrice + (j * gridDistance);
+              
+              // Skip this order if it would execute immediately against the market
+              if (price >= this.currentMarketPrice) {
+                this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+                continue;
+              }
+              
+              try {
+                await this.createOrder(price, ORDER_SIZE, 'buy', null);
+                this.logger.success(`Placed gap-filling BUY order at ${price.toFixed(2)}`);
+                
+                // Sleep briefly between order placements
+                if (j < ordersToInsert) {
+                  await new Promise(resolve => setTimeout(resolve, 200));
+                }
+              } catch (error) {
+                this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
+                // Continue with next order
+              }
+            }
+          }
+        }
+      }
+      
+      // Check for gaps between consecutive sell orders
+      for (let i = 0; i < sellOrders.length - 1; i++) {
+        const currentPrice = sellOrders[i].price;
+        const nextPrice = sellOrders[i + 1].price;
+        const gap = nextPrice - currentPrice;
+        
+        if (gap > maxAllowedGap) {
+          this.logger.warn(`Detected gap between sell orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
+          
+          // Calculate number of orders to insert
+          const ordersToInsert = Math.floor(gap / gridDistance) - 1;
+          
+          if (ordersToInsert > 0) {
+            for (let j = 1; j <= ordersToInsert; j++) {
+              const price = currentPrice + (j * gridDistance);
+              
+              // Skip this order if it would execute immediately against the market
+              if (price <= this.currentMarketPrice) {
+                this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+                continue;
+              }
+              
+              try {
+                const order = await this.createOrder(price, ORDER_SIZE, 'sell', null);
+                order.entryPrice = this.referencePrice;
+                this.logger.success(`Placed gap-filling SELL order at ${price.toFixed(2)}`);
+                
+                // Sleep briefly between order placements
+                if (j < ordersToInsert) {
+                  await new Promise(resolve => setTimeout(resolve, 200));
+                }
+              } catch (error) {
+                this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
+                // Continue with next order
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error in checkAndFillGridGaps: ${error}`);
+    }
+  }
+  
+  /**
    * Clean up resources when shutting down
    */
   public cleanup(): void {
     this.stopPeriodicSync();
+    this.stopATRRecalculationInterval();
     this.logger.info('Order manager resources cleaned up');
+  }
+
+  /**
+   * Convert trade data to candles for technical indicators
+   */
+  private tradesIntoCandles(trades: any[]): Candle[] {
+    const candles: Candle[] = [];
+    let currentCandle: Candle | null = null;
+    let candleMTS = 0;
+    const candleSizeMS = 1000 * 60; // 1-minute candles
+    
+    for (const trade of trades) {
+      const { timestamp, price } = trade;
+      const mts = new Date(timestamp).getTime();
+      
+      if (candleMTS === 0 || (mts - candleMTS > candleSizeMS)) {
+        // Start new candle
+        if (currentCandle) {
+          candles.push(currentCandle);
+        }
+        
+        candleMTS = mts;
+        currentCandle = {
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          timestamp: mts
+        };
+      } else if (currentCandle) {
+        // Update current candle
+        currentCandle.high = Math.max(currentCandle.high, price);
+        currentCandle.low = Math.min(currentCandle.low, price);
+        currentCandle.close = price;
+      }
+    }
+    
+    // Add final candle
+    if (currentCandle) {
+      candles.push(currentCandle);
+    }
+    
+    return candles;
+  }
+  
+  /**
+   * Calculate ATR and update grid spacing based on volatility
+   */
+  async calculateATRAndUpdateGridSpacing(): Promise<void> {
+    try {
+      // Fetch historical trades from BitMEX
+      const trades = await this.api.getHistoricalTrades(
+        this.symbol,
+        ATR_HISTORICAL_TRADES_LOOKBACK,
+        1000
+      );
+      
+      if (!trades || trades.length === 0) {
+        this.logger.warn('No historical trades found for ATR calculation');
+        return;
+      }
+      
+      this.logger.info(`Converting ${trades.length} trades to candles for ATR calculation`);
+      
+      // Convert trades to candles
+      const candles = this.tradesIntoCandles(trades);
+      this.candles = candles;
+      
+      if (candles.length < ATR_PERIOD + 1) {
+        this.logger.warn(`Not enough candles for ATR calculation: ${candles.length} < ${ATR_PERIOD + 1}`);
+        return;
+      }
+      
+      // Reset ATR indicator
+      this.atrInstance = new ATR([ATR_PERIOD]);
+      
+      // Feed candles to ATR indicator
+      for (const candle of candles) {
+        this.atrInstance.add(candle);
+      }
+      
+      // Get ATR value
+      const atrValues = this.atrInstance._values as number[]; // Access internal values
+      const atrValue = atrValues[atrValues.length - 1];
+      
+      if (!atrValue || isNaN(atrValue)) {
+        this.logger.warn('Invalid ATR value calculated');
+        return;
+      }
+      
+      // Calculate new grid spacing based on ATR
+      const newGridDistance = Math.min(
+        Math.max(
+          Math.round(atrValue * ATR_MULTIPLIER),
+          ATR_MINIMUM_GRID_DISTANCE
+        ),
+        ATR_MAXIMUM_GRID_DISTANCE
+      );
+      
+      // Update grid sizing config
+      this.gridSizing = {
+        useATR: true,
+        currentDistance: newGridDistance,
+        lastATRValue: atrValue,
+        lastRecalculation: Date.now()
+      };
+      
+      // Save to state manager
+      this.stateManager.updateGridSizing(this.gridSizing);
+      
+      this.logger.success(`ATR calculated: ${atrValue.toFixed(2)}, Grid spacing updated: ${newGridDistance} (previous: ${ORDER_DISTANCE})`);
+      
+      // Log if grid spacing changed significantly
+      const changePercent = Math.abs((newGridDistance - ORDER_DISTANCE) / ORDER_DISTANCE) * 100;
+      if (changePercent > 20) {
+        this.logger.star(`Grid spacing changed by ${changePercent.toFixed(1)}% from default due to market volatility`);
+      }
+      
+    } catch (error) {
+      this.logger.error(`Failed to calculate ATR: ${error}`);
+    }
+  }
+  
+  /**
+   * Start ATR recalculation interval
+   */
+  startATRRecalculationInterval(): void {
+    this.logger.info(`Starting ATR recalculation every ${ATR_RECALCULATION_INTERVAL/1000/60} minutes`);
+    
+    this.atrRecalculationIntervalId = setInterval(async () => {
+      this.logger.debug('Running scheduled ATR recalculation');
+      await this.calculateATRAndUpdateGridSpacing();
+      
+      // If grid is active, log current grid metrics
+      if (this.gridInitialized) {
+        this.logger.info(`Current grid: ${this.activeOrders.length} orders, spacing: ${this.gridSizing.currentDistance}, ATR: ${this.gridSizing.lastATRValue.toFixed(2)}`);
+      }
+    }, ATR_RECALCULATION_INTERVAL);
+  }
+  
+  /**
+   * Stop ATR recalculation interval
+   */
+  stopATRRecalculationInterval(): void {
+    if (this.atrRecalculationIntervalId) {
+      clearInterval(this.atrRecalculationIntervalId);
+      this.atrRecalculationIntervalId = null;
+      this.logger.info('Stopped ATR recalculation interval');
+    }
+  }
+  
+  /**
+   * Get current grid distance based on ATR or constant
+   */
+  getGridDistance(): number {
+    return this.gridSizing.useATR ? this.gridSizing.currentDistance : ORDER_DISTANCE;
   }
 } 

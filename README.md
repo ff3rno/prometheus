@@ -1,155 +1,79 @@
-# Prometheus - BitMEX Grid Trading Bot
+# Prometheus
 
-A sophisticated grid trading bot for BitMEX that automatically places buy and sell orders at predetermined price intervals, creating a "grid" of orders. When price moves up or down and hits orders, the bot automatically places new opposite orders, generating profits from price oscillations.
+A sophisticated BitMEX Grid Trading Bot designed for efficient cryptocurrency trading on the BitMEX exchange.
+
+## Overview
+
+Prometheus is an automated trading bot implementing a grid trading strategy on BitMEX. Grid trading involves placing buy and sell orders at regular price intervals, creating a grid of orders that can profit from price volatility within a range.
 
 ## Features
 
-- **Live Trading**: Place real orders on BitMEX exchange
-- **Dry Run Mode**: Test strategies without placing real orders
-- **State Persistence**: Trading state is saved to disk using LowDB
-- **Automatic Recovery**: Restores state after restart or crashes
-- **Real-time Order Management**: Tracks orders and manages fills
-- **Profit Tracking**: Monitors P&L, fees, and trading volume
-- **Configurable Grid Parameters**: Customize order size, count, and distance
-- **Automatic grid creation and management**
-- **Real-time trade tracking via BitMEX WebSocket API**
-- **Order execution and fill tracking**
-- **State persistence for seamless restarts**
-- **Dry run mode for testing without real orders**
-- **Metrics tracking with InfluxDB 3**
+- **Grid Trading Strategy** - Places orders at configurable intervals to capitalize on price movements
+- **Live Trading & Dry Run Modes** - Test with no risk using the dry run mode
+- **Real-Time Data Processing** - WebSocket integration for live market data
+- **State Persistence** - Trading session state is saved and can be resumed
+- **Metrics Integration** - Optional InfluxDB integration for performance tracking
+- **Smart API Management** - Rate limiting and exponential backoff for API interaction
+- **Auto-Reconnection** - Robust WebSocket reconnection with exponential backoff
+- **Comprehensive Logging** - Detailed activity logs for monitoring
 
-## Prerequisites
+## Installation
 
-- Node.js (v16+)
+### Prerequisites
+
+- Node.js (v14 or later)
 - npm or yarn
-- BitMEX API credentials (for live trading)
+- BitMEX account with API credentials (for live trading)
+- InfluxDB (optional, for metrics collection)
+
+### Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/prometheus.git
+cd prometheus
+```
+
+2. Install dependencies:
+```bash
+npm install
+```
+
+3. Build the project:
+```bash
+npm run build
+```
+
+4. Create a `.env` file in the project root with your configuration (see Configuration section).
 
 ## Configuration
-
-Edit the following parameters in `src/constants.ts` to customize your grid:
-
-- `ORDER_COUNT`: Number of orders on each side of the grid
-- `ORDER_DISTANCE`: Price distance between each grid level
-- `ORDER_SIZE`: Size of each order in BTC
-- `FEE_RATE`: Trading fee rate in percentage
 
 Create a `.env` file with the following variables:
 
 ```
-# BitMEX API credentials
+# BitMEX API Credentials
 BITMEX_API_KEY=your_api_key
 BITMEX_API_SECRET=your_api_secret
+
+# Trading Configuration
 TRADING_SYMBOL=XBTUSD
+DRY_RUN=true  # Set to false for live trading
 
-# Optional: Run in dry-run mode (no real orders)
-DRY_RUN=false
-
-# Optional: Data directory for state persistence
+# Data Directory
 DATA_DIR=./data
 
-# InfluxDB Metrics (optional)
-INFLUX_ENABLED=true
+# InfluxDB Configuration (Optional)
+INFLUX_ENABLED=false
 INFLUX_HOST=http://localhost:8086
 INFLUX_TOKEN=your_influx_token
 INFLUX_DATABASE=prometheus_grid
 ```
 
-## InfluxDB Metrics Integration
-
-The bot can track trading metrics in InfluxDB 3, including:
-
-- Round-trip trade profits
-- Order execution fees
-- Trading volume
-- Overall grid performance
-
-### Setting up InfluxDB 3
-
-1. Install InfluxDB 3 following the instructions at https://docs.influxdata.com/influxdb/v3/
-
-2. Create a token with appropriate permissions:
-   ```
-   influx auth create \
-     --name "prometheus-bot" \
-     --description "Token for Prometheus grid trading bot" \
-     --org your-org
-   ```
-
-3. Create a database (bucket):
-   ```
-   influx bucket create --name prometheus_grid --org your-org
-   ```
-
-4. Configure the bot with your InfluxDB credentials in the `.env` file:
-   ```
-   INFLUX_ENABLED=true
-   INFLUX_HOST=http://localhost:8086
-   INFLUX_TOKEN=your_influx_token
-   INFLUX_DATABASE=prometheus_grid
-   ```
-
-### Available Metrics
-
-The bot tracks the following metrics in InfluxDB:
-
-1. **Trade Metrics** (measurement: `trade`)
-   - `profit`: Net profit/loss from completed round-trip trades
-   - `fees`: Total fees paid for the trade
-   - `volume`: Trading volume in BTC
-   - `entry_price`: Price at which the position was entered
-   - `exit_price`: Price at which the position was exited
-
-2. **Order Execution Metrics** (measurement: `order`)
-   - `price`: Execution price
-   - `size`: Order size in BTC
-   - `fee`: Fee for this order
-   - `notional_value`: USD value of the order
-
-3. **Volume Metrics** (measurement: `volume`)
-   - `size`: Volume in BTC
-   - `notional_value`: USD value of the volume
-
-4. **Grid Statistics** (measurement: `grid_stats`)
-   - `total_profit`: Cumulative profit/loss
-   - `total_orders`: Total number of orders
-   - `buy_orders`: Number of buy orders
-   - `sell_orders`: Number of sell orders
-   - `total_fees`: Total fees paid
-
-### Visualizing Metrics
-
-You can visualize these metrics using the InfluxDB UI or by connecting tools like Grafana.
-
-Example InfluxDB query to view all trade profits:
-```sql
-SELECT profit, fees, volume, entry_price, exit_price 
-FROM trade 
-WHERE time > now() - 7d
-```
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/prometheus.git
-   cd prometheus
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Build the project:
-   ```bash
-   npm run build
-   ```
-
 ## Usage
 
-### Dry Run Mode (No real orders)
+### Dry Run Mode
 
-To run the bot in dry run mode (simulation only):
+Run the bot in dry run mode (no real orders will be placed):
 
 ```bash
 npm run dry-run
@@ -157,43 +81,68 @@ npm run dry-run
 
 ### Live Trading Mode
 
-To run the bot in live trading mode (will place real orders):
+⚠️ **WARNING**: This will place real orders using your BitMEX account. 
 
 ```bash
 npm start
 ```
 
-### Viewing Current BitMEX Orders
+### Development Mode
 
-To view your current open orders on BitMEX:
+For development with live reloading:
+
+```bash
+npm run dev
+```
+
+### Print Orders
+
+To view the current order grid:
 
 ```bash
 npm run print-orders
 ```
 
-## State Management
+## Configuration Options
 
-The bot persists its state to a JSON file in the data directory (configurable via `DATA_DIR` in `.env`). This includes:
+The trading behavior can be customized by modifying the constants in `src/constants.ts`:
 
+- `ORDER_COUNT`: Number of orders on each side of the grid
+- `ORDER_DISTANCE`: Price distance between grid orders
+- `ORDER_SIZE`: Size of each order in BTC
+
+## Key Components
+
+- **LiveOrderManager**: Manages the order grid, processes trades, and handles order fills
+- **LiveWebSocket**: Connects to BitMEX WebSocket API to receive real-time market data
+- **BitMEXAPI**: Handles all REST API interactions with BitMEX
+- **StateManager**: Provides state persistence across bot restarts
+- **MetricsManager**: Records trading metrics to InfluxDB (when enabled)
+
+## Data Storage
+
+The bot stores state in a JSON file located in the data directory. This includes:
 - Active orders
 - Completed trades
 - Cumulative P&L
 - Trading statistics
-- Reference price
 
-This allows the bot to recover its state after restarts or crashes.
+## Contributing
 
-## Safety Features
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-- `DRY_RUN` mode for testing without placing real orders
-- `ParticipateDoNotInitiate` execution instruction to prevent taking liquidity
-- Graceful shutdown handling via SIGINT/SIGTERM signals
-- Error handling and reconnection for WebSocket disconnections
-
-## Risk Warning
-
-This software is for educational purposes only. Use at your own risk. Trading cryptocurrencies involves significant risk and can result in the loss of your capital. You should only trade with funds you are willing to lose.
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Disclaimer
+
+Trading cryptocurrencies involves significant risk and can result in the loss of your invested capital. This software is provided for educational purposes only and you should not risk money that you cannot afford to lose. The creators of this software are not responsible for any financial losses incurred while using this software.
+
+Always start with small amounts and test thoroughly before committing significant capital.

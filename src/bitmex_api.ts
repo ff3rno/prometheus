@@ -456,4 +456,60 @@ export class BitMEXAPI {
       return null;
     }
   }
+
+  /**
+   * Fetch historical trades for ATR calculation
+   * @param symbol The trading symbol
+   * @param lookbackMinutes How many minutes to look back
+   * @param maxResults Maximum number of trades to fetch
+   */
+  async getHistoricalTrades(symbol: string = 'XBTUSD', lookbackMinutes: number = 120, maxResults: number = 1000): Promise<any[]> {
+    try {
+      // Calculate timestamp for lookback period
+      const lookbackTime = new Date();
+      lookbackTime.setMinutes(lookbackTime.getMinutes() - lookbackMinutes);
+      const startTime = lookbackTime.toISOString();
+      
+      this.logger.info(`Fetching historical trades for ${symbol} since ${startTime}`);
+      
+      let allTrades: any[] = [];
+      let startIndex = 0;
+      const maxResultsPerPage = 500; // BitMEX API max per request
+      let hasMore = true;
+      
+      // Loop until we've fetched all trades or reached maxResults
+      while (hasMore && allTrades.length < maxResults) {
+        const response = await this.makeRequest('GET', '/api/v1/trade', {
+          symbol: symbol,
+          startTime: startTime,
+          count: Math.min(maxResultsPerPage, maxResults - allTrades.length),
+          start: startIndex,
+          reverse: true // Newest first
+        });
+        
+        if (!response || response.length === 0) {
+          hasMore = false;
+        } else {
+          allTrades = allTrades.concat(response);
+          startIndex += response.length;
+          
+          // If we got fewer results than the max, we've reached the end
+          if (response.length < maxResultsPerPage) {
+            hasMore = false;
+          }
+          
+          // Small delay to avoid overwhelming the API
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      }
+      
+      this.logger.success(`Fetched ${allTrades.length} historical trades for ${symbol}`);
+      
+      // Sort by timestamp (oldest first for proper ATR calculation)
+      return allTrades.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+    } catch (error) {
+      this.logger.error(`Failed to fetch historical trades: ${error}`);
+      throw error;
+    }
+  }
 } 

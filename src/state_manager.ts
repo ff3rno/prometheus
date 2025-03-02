@@ -2,7 +2,7 @@ import { Low } from 'lowdb';
 import { JSONFile } from 'lowdb/node';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Order, CompletedTrade } from './types';
+import { Order, CompletedTrade, GridSizingConfig } from './types';
 import { StatsLogger } from './logger';
 
 // Define the database schema
@@ -18,6 +18,7 @@ interface AppState {
   cumulativeVolume: number;
   lastUpdated: string;
   sessionStartTime: string;
+  gridSizing?: GridSizingConfig;
 }
 
 export class StateManager {
@@ -142,6 +143,17 @@ export class StateManager {
     if (!this.db.data) return;
     
     this.db.data.referencePrice = price;
+    await this.saveState();
+  }
+  
+  /**
+   * Update grid sizing configuration
+   */
+  async updateGridSizing(gridSizing: GridSizingConfig): Promise<void> {
+    if (!this.db.data) return;
+    
+    this.db.data.gridSizing = gridSizing;
+    this.logger.debug(`Updated grid sizing configuration: distance=${gridSizing.currentDistance}, lastATR=${gridSizing.lastATRValue}`);
     await this.saveState();
   }
   

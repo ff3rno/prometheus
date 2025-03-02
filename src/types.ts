@@ -267,4 +267,21 @@ export interface BitMEXPosition {
   timestamp: string
   lastPrice?: number
   lastValue?: number
+}
+
+// Candle data interface for technical indicators
+export interface Candle {
+  timestamp: number
+  open: number
+  high: number
+  low: number
+  close: number
+}
+
+// Grid sizing configuration
+export interface GridSizingConfig {
+  useATR: boolean
+  currentDistance: number
+  lastATRValue: number
+  lastRecalculation: number
 } 

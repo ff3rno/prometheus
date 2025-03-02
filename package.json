@@ -15,6 +15,7 @@
   "dependencies": {
     "@influxdata/influxdb3-client": "^1.0.0",
     "axios": "^1.6.2",
+    "bfx-hf-indicators": "^2.0.8",
     "bottleneck": "^2.19.5",
     "dotenv": "^16.3.1",
     "lowdb": "^6.1.1",
