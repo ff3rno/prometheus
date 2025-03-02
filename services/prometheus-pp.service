@@ -1,0 +1,25 @@
+[Unit]
+Description=Prometheus BitMEX Grid Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=f3rno
+WorkingDirectory=/home/ubuntu/prometheus
+ExecStart=/usr/bin/node dist/main_pp.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=prometheus-pp
+Environment=NODE_ENV=production
+Environment=BITMEX_API_KEY=
+Environment=BITMEX_API_SECRET=
+Environment=TRADING_SYMBOL=XBTUSD
+Environment=INFLUX_HOST=
+Environment=INFLUX_TOKEN=
+Environment=INFLUX_DATABASE=prometheus
+Environment=INFLUX_ENABLED=true
+
+[Install]
+WantedBy=multi-user.target 
