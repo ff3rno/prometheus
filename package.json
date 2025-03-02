@@ -1,7 +1,7 @@
 {
   "name": "prometheus",
   "version": "1.0.0",
-  "description": "BitMEX Grid Trading Bot",
+  "description": "Advanced BitMEX grid trading bot with dynamic sizing, trend detection, and comprehensive metrics for optimized cryptocurrency trading.",
   "main": "dist/main_pp.js",
   "scripts": {
     "build": "tsc",

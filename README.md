@@ -8,14 +8,17 @@ Prometheus is an automated trading bot implementing a grid trading strategy on B
 
 ## Features
 
-- **Grid Trading Strategy** - Places orders at configurable intervals to capitalize on price movements
+- **Advanced Grid Trading Strategy** - Places orders at configurable intervals to capitalize on price movements
+- **Dynamic Grid Sizing** - Adjusts grid spacing based on Average True Range (ATR) for volatility-responsive trading
+- **Trend Detection** - Uses RSI, Fast/Slow EMA indicators to identify market trends and adjust strategy
+- **Asymmetric Grid Positioning** - Automatically places wider grid spacing in the trend direction for optimized profit potential
 - **Live Trading & Dry Run Modes** - Test with no risk using the dry run mode
 - **Real-Time Data Processing** - WebSocket integration for live market data
 - **State Persistence** - Trading session state is saved and can be resumed
-- **Metrics Integration** - Optional InfluxDB integration for performance tracking
+- **Comprehensive Metrics Integration** - InfluxDB integration for detailed performance tracking including profit/loss, volume, fees, ATR values, and trend metrics
 - **Smart API Management** - Rate limiting and exponential backoff for API interaction
 - **Auto-Reconnection** - Robust WebSocket reconnection with exponential backoff
-- **Comprehensive Logging** - Detailed activity logs for monitoring
+- **Detailed Logging** - Comprehensive activity logs with trading statistics
 
 ## Installation
 
@@ -107,17 +110,29 @@ npm run print-orders
 
 The trading behavior can be customized by modifying the constants in `src/constants.ts`:
 
+### Basic Configuration
 - `ORDER_COUNT`: Number of orders on each side of the grid
-- `ORDER_DISTANCE`: Price distance between grid orders
+- `ORDER_DISTANCE`: Base distance between grid orders
 - `ORDER_SIZE`: Size of each order in BTC
+
+### Advanced Configuration
+- `ATR_PERIOD`: Period for ATR calculation (default: 14)
+- `ATR_MULTIPLIER`: Multiplier for ATR to determine grid spacing (default: 1.5)
+- `ATR_MINIMUM_GRID_DISTANCE`: Minimum grid distance in USD (default: 50)
+- `ATR_MAXIMUM_GRID_DISTANCE`: Maximum grid distance in USD (default: 250)
+- `TREND_RSI_PERIOD`: RSI period for trend detection (default: 14)
+- `TREND_FAST_EMA_PERIOD`: Fast EMA period for trend detection (default: 8)
+- `TREND_SLOW_EMA_PERIOD`: Slow EMA period for trend detection (default: 21)
+- `TREND_MAX_ASYMMETRY`: Maximum grid spacing multiplier in trend direction (default: 1.5)
 
 ## Key Components
 
 - **LiveOrderManager**: Manages the order grid, processes trades, and handles order fills
+- **TrendAnalyzer**: Detects market trends using technical indicators to optimize grid placement
 - **LiveWebSocket**: Connects to BitMEX WebSocket API to receive real-time market data
 - **BitMEXAPI**: Handles all REST API interactions with BitMEX
 - **StateManager**: Provides state persistence across bot restarts
-- **MetricsManager**: Records trading metrics to InfluxDB (when enabled)
+- **MetricsManager**: Records comprehensive trading metrics to InfluxDB (when enabled)
 
 ## Data Storage
 
@@ -126,6 +141,18 @@ The bot stores state in a JSON file located in the data directory. This includes
 - Completed trades
 - Cumulative P&L
 - Trading statistics
+- Grid configuration
+
+## Metrics Collection
+
+When InfluxDB integration is enabled, the bot tracks:
+- Trade profit/loss
+- Order executions
+- Trading volume
+- Grid statistics
+- ATR values
+- Trend metrics and grid distances
+- Grid asymmetry factors
 
 ## Contributing
 
