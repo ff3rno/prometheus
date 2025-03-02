@@ -3,6 +3,7 @@ import { BITMEX_WS_API_URL } from './constants';
 import { BitMEXTrade } from './types';
 import { LiveOrderManager } from './live_order_manager';
 import { StatsLogger } from './logger';
+import crypto from 'crypto';
 
 // WebSocket connection states for better logging
 enum ConnectionState {
@@ -91,6 +92,36 @@ export class LiveWebSocket {
     }
   }
 
+  private generateSignature(apiSecret: string): { signature: string; expires: number } {
+    const expires = Math.round(Date.now() / 1000) + 60; // 1 minute in the future
+    const signature = crypto
+      .createHmac('sha256', apiSecret)
+      .update(`GET/realtime${expires}`)
+      .digest('hex');
+      
+    return { signature, expires };
+  }
+
+  private authenticate(): void {
+    if (!this.apiKey || !this.apiSecret) {
+      this.logger.warn('Cannot authenticate WebSocket: API credentials not provided');
+      return;
+    }
+    
+    try {
+      const { signature, expires } = this.generateSignature(this.apiSecret);
+      
+      this.ws.send(JSON.stringify({
+        op: 'authKeyExpires',
+        args: [this.apiKey, expires, signature]
+      }));
+      
+      this.logger.info('Sent WebSocket authentication request');
+    } catch (error) {
+      this.logger.error(`Authentication error: ${(error as Error).message}`);
+    }
+  }
+
   private onOpen(): void {
     this.logStatusChange(ConnectionState.CONNECTED, 'WebSocket connection established successfully');
     
@@ -98,9 +129,11 @@ export class LiveWebSocket {
     this.reconnectAttempts = 0;
     this.reconnecting = false;
     
-    // Subscribe to XBT/USD trade data and execution data (for order fills)
+    // Authenticate the connection if credentials are provided
     if (this.apiKey && this.apiSecret) {
-      // Authenticated connection - subscribe to order execution data
+      this.authenticate();
+      
+      // Subscribe to XBT/USD trade data and execution data (for order fills)
       this.ws.send(JSON.stringify({
         op: 'subscribe',
         args: [
@@ -175,6 +208,14 @@ export class LiveWebSocket {
           this.logger.warn(`Order ${order.orderID} was cancelled`);
         }
       });
+    }
+    // Handle authentication success or failure
+    else if (message.request && message.request.op === 'authKeyExpires') {
+      if (message.success) {
+        this.logger.success('WebSocket authentication successful');
+      } else if (message.error) {
+        this.logger.error(`WebSocket authentication failed: ${message.error}`);
+      }
     }
     else {
       // If the message contains connection status information, log it appropriately
