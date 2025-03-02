@@ -6,12 +6,15 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/prometheus
-ExecStart=/usr/bin/node dist/main_pp.js
+ExecStart=/home/ubuntu/prometheus/start.sh
+KillMode=process
 Restart=on-failure
 RestartSec=10
 StandardOutput=syslog
 StandardError=syslog
 SyslogIdentifier=prometheus-pp
+LimitNOFILE=4096
+IgnoreSIGPIPE=false
 Environment=NODE_ENV=production
 Environment=BITMEX_API_KEY=
 Environment=BITMEX_API_SECRET=
