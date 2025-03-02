@@ -5,8 +5,7 @@
   "main": "dist/main_pp.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/main_pp.js",
-    "dev": "ts-node src/main_pp.ts",
+    "start": "ts-node src/main_pp.ts",
     "dry-run": "cross-env DRY_RUN=true ts-node src/main_pp.ts",
     "print-orders": "ts-node src/main_print_orders.ts"
   },
