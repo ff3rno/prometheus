@@ -2,13 +2,14 @@
 export const BITMEX_WS_API_URL = 'wss://ws.bitmex.com/realtime'
 
 // Market making parameters
-export const ORDER_COUNT = 10 // Number of orders on each side
+export const ORDER_COUNT = 12 // Number of orders on each side
 export const ORDER_DISTANCE = 100 // Distance between each order in USD
-export const ORDER_SIZE = 0.005 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts)
+export const ORDER_SIZE = 0.007 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts)
 
 // Safety measures
 export const MAX_POSITION_SIZE_BTC = 0.1 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 30 // Maximum number of open orders allowed
+export const DEAD_MAN_SWITCH_ENABLED = false // Whether to enable the dead man's switch functionality
 export const DEAD_MAN_SWITCH_INTERVAL = 1000 * 60 * 1 // Reset dead man's switch every minute
 export const DEAD_MAN_SWITCH_TIMEOUT = 1000 * 60 * 2 // Cancel all orders after 2 minutes of inactivity
 
@@ -17,6 +18,7 @@ export const ATR_PERIOD = 14 // Period for ATR calculation
 export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing
 export const ATR_MINIMUM_GRID_DISTANCE = 60 // Minimum grid distance in USD
 export const ATR_MAXIMUM_GRID_DISTANCE = 225 // Maximum grid distance in USD
+export const GAP_DETECTION_TOLERANCE = 2.0 // Multiplier for grid distance to identify gaps (higher = less sensitive)
 export const ATR_RECALCULATION_INTERVAL =  1000 * 60 * 15 // Recalculate ATR
 export const ATR_HISTORICAL_TRADES_LOOKBACK = 90 // How many minutes to look back for historical trades
 

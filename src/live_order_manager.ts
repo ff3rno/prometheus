@@ -22,7 +22,9 @@ import {
   DEAD_MAN_SWITCH_TIMEOUT,
   FEE_RATE,
   ENFORCE_ORDER_DISTANCE,
-  getNextOrderId
+  getNextOrderId,
+  DEAD_MAN_SWITCH_ENABLED,
+  GAP_DETECTION_TOLERANCE
 } from './constants';
 import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
 
@@ -412,6 +414,18 @@ export class LiveOrderManager {
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
     // Round price to tick size
     const roundedPrice = this.roundPriceToTickSize(price);
+    
+    // Check if we already have an order at this price point
+    const existingOrder = this.activeOrders.find(
+      order => !order.filled && 
+               order.side === side && 
+               Math.abs(order.price - roundedPrice) < this.instrumentInfo?.tickSize! / 2
+    );
+    
+    if (existingOrder) {
+      this.logger.warn(`Skipping ${side} order at ${roundedPrice} - already have an order at this price point`);
+      return existingOrder;
+    }
     
     // Check if we would exceed the maximum number of open orders
     if (this.wouldExceedOrderLimit()) {
@@ -1000,7 +1014,7 @@ export class LiveOrderManager {
     }
     
     // Find the highest buy order and lowest sell order
-    const highestBuy = buyOrders[buyOrders.length - 1].price;
+    const highestBuy = buyOrders[0].price;
     const lowestSell = sellOrders[0].price;
     
     // Get asymmetric grid distances
@@ -1013,8 +1027,8 @@ export class LiveOrderManager {
     // Log current grid state for debugging
     this.logger.debug(`Grid state: ${buyOrders.length} buy orders (highest: ${highestBuy.toFixed(2)}), ${sellOrders.length} sell orders (lowest: ${lowestSell.toFixed(2)})`);
     
-    // Threshold for gap detection (1.5x normal distance to account for some flexibility)
-    const maxAllowedGap = midGridDistance * 1.5;
+    // Threshold for gap detection (using the new configurable tolerance value)
+    const maxAllowedGap = midGridDistance * GAP_DETECTION_TOLERANCE;
     
     // Check if there's a large gap between highest buy and lowest sell
     if (lowestSell - highestBuy > maxAllowedGap) {
@@ -1034,10 +1048,17 @@ export class LiveOrderManager {
       if (possibleOrderCount > 0) {
         this.logger.info(`Filling gap with ${possibleOrderCount} orders`);
         
+        // Create a set of existing price points (rounded to tick size) for quick lookup
+        const existingPricePoints = new Set<number>(
+          this.activeOrders
+            .filter(order => !order.filled)
+            .map(order => this.roundPriceToTickSize(order.price))
+        );
+        
         // Place orders to fill the gap
         for (let i = 1; i <= possibleOrderCount; i++) {
           const ratio = i / (possibleOrderCount + 1);
-          const price = highestBuy + (gapSize * ratio);
+          const price = this.roundPriceToTickSize(highestBuy + (gapSize * ratio));
           
           // Determine order side based on position relative to the reference price
           const side = price < this.referencePrice ? 'buy' : 'sell';
@@ -1049,8 +1070,17 @@ export class LiveOrderManager {
             continue;
           }
           
+          // Skip if an order already exists at this price point
+          if (existingPricePoints.has(price)) {
+            this.logger.warn(`Skipping gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)} - order already exists at this price point`);
+            continue;
+          }
+          
           try {
             const order = await this.createOrder(price, ORDER_SIZE, side, null);
+            // Add the new price point to our set to prevent duplicates in the same batch
+            existingPricePoints.add(price);
+            
             if (side === 'sell') {
               order.entryPrice = this.referencePrice;
             }
@@ -1062,11 +1092,17 @@ export class LiveOrderManager {
             }
           } catch (error) {
             this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-            // Continue with next order rather than stopping the entire process
           }
         }
       }
     }
+    
+    // Create a set of existing price points for quick lookup
+    const existingPricePoints = new Set<number>(
+      this.activeOrders
+        .filter(order => !order.filled)
+        .map(order => this.roundPriceToTickSize(order.price))
+    );
     
     // Check for gaps between consecutive buy orders
     for (let i = 0; i < buyOrders.length - 1; i++) {
@@ -1075,7 +1111,7 @@ export class LiveOrderManager {
       const gap = nextPrice - currentPrice;
       
       // Buy orders should use downward spacing
-      const maxAllowedBuyGap = downwardGridSpacing * 1.5;
+      const maxAllowedBuyGap = downwardGridSpacing * GAP_DETECTION_TOLERANCE;
       
       if (gap > maxAllowedBuyGap) {
         this.logger.warn(`Detected gap between buy orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
@@ -1085,16 +1121,25 @@ export class LiveOrderManager {
         
         if (ordersToInsert > 0) {
           for (let j = 1; j <= ordersToInsert; j++) {
-            const price = currentPrice + (j * downwardGridSpacing);
+            const price = this.roundPriceToTickSize(currentPrice + (j * downwardGridSpacing));
             
             // Skip this order if it would execute immediately against the market
-            if (price >= currentPrice) {
-              this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - would execute immediately at market price ${currentPrice.toFixed(2)}`);
+            if (price >= this.currentMarketPrice) {
+              this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+              continue;
+            }
+            
+            // Skip if an order already exists at this price point
+            if (existingPricePoints.has(price)) {
+              this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - order already exists at this price point`);
               continue;
             }
             
             try {
               await this.createOrder(price, ORDER_SIZE, 'buy', null);
+              // Add the new price point to our set to prevent duplicates in the same batch
+              existingPricePoints.add(price);
+              
               this.logger.success(`Placed gap-filling BUY order at ${price.toFixed(2)}`);
               
               // Sleep briefly between order placements
@@ -1103,7 +1148,6 @@ export class LiveOrderManager {
               }
             } catch (error) {
               this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-              // Continue with next order
             }
           }
         }
@@ -1117,7 +1161,7 @@ export class LiveOrderManager {
       const gap = nextPrice - currentPrice;
       
       // Sell orders should use upward spacing
-      const maxAllowedSellGap = upwardGridSpacing * 1.5;
+      const maxAllowedSellGap = upwardGridSpacing * GAP_DETECTION_TOLERANCE;
       
       if (gap > maxAllowedSellGap) {
         this.logger.warn(`Detected gap between sell orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
@@ -1127,16 +1171,25 @@ export class LiveOrderManager {
         
         if (ordersToInsert > 0) {
           for (let j = 1; j <= ordersToInsert; j++) {
-            const price = currentPrice + (j * upwardGridSpacing);
+            const price = this.roundPriceToTickSize(currentPrice + (j * upwardGridSpacing));
             
             // Skip this order if it would execute immediately against the market
-            if (price <= currentPrice) {
-              this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - would execute immediately at market price ${currentPrice.toFixed(2)}`);
+            if (price <= this.currentMarketPrice) {
+              this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+              continue;
+            }
+            
+            // Skip if an order already exists at this price point
+            if (existingPricePoints.has(price)) {
+              this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - order already exists at this price point`);
               continue;
             }
             
             try {
               const order = await this.createOrder(price, ORDER_SIZE, 'sell', null);
+              // Add the new price point to our set to prevent duplicates in the same batch
+              existingPricePoints.add(price);
+              
               order.entryPrice = this.referencePrice;
               this.logger.success(`Placed gap-filling SELL order at ${price.toFixed(2)}`);
               
@@ -1146,7 +1199,6 @@ export class LiveOrderManager {
               }
             } catch (error) {
               this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-              // Continue with next order
             }
           }
         }
@@ -1503,36 +1555,73 @@ export class LiveOrderManager {
   }
 
   private startDeadManSwitch(): void {
+    // Check if dead man's switch is enabled in constants
+    if (!DEAD_MAN_SWITCH_ENABLED) {
+      this.logger.info('Dead man\'s switch is disabled via configuration');
+      return;
+    }
+    
     // Skip in dry run mode
     if (this.isDryRun) {
       this.logger.info('Dead man\'s switch disabled in dry run mode');
       return;
     }
     
-    // Set the initial dead man's switch
-    this.resetDeadManSwitch();
+    // Get reference to the websocket instance from main_pp.ts
+    const websocket = this.stateManager.getWebSocket();
     
-    // Set up interval to periodically reset the dead man's switch
-    this.deadManSwitchIntervalId = setInterval(() => {
-      this.resetDeadManSwitch();
-    }, DEAD_MAN_SWITCH_INTERVAL);
+    if (!websocket) {
+      this.logger.warn('WebSocket not available, falling back to REST API for dead man\'s switch');
+      // Set the initial dead man's switch using REST API as fallback
+      this.resetDeadManSwitchREST();
+      
+      // Set up interval to periodically reset the dead man's switch
+      this.deadManSwitchIntervalId = setInterval(() => {
+        this.resetDeadManSwitchREST();
+      }, DEAD_MAN_SWITCH_INTERVAL);
+    } else {
+      // Set the initial dead man's switch using WebSocket
+      websocket.setDeadManSwitch(DEAD_MAN_SWITCH_TIMEOUT);
+      
+      // Set up interval to periodically reset the dead man's switch
+      this.deadManSwitchIntervalId = setInterval(() => {
+        websocket.setDeadManSwitch(DEAD_MAN_SWITCH_TIMEOUT);
+      }, DEAD_MAN_SWITCH_INTERVAL);
+    }
     
     this.logger.info(`Dead man's switch initialized: will cancel all orders after ${DEAD_MAN_SWITCH_TIMEOUT / 1000} seconds of inactivity`);
   }
 
-  private async resetDeadManSwitch(): Promise<void> {
+  /**
+   * Legacy method that uses REST API to set the dead man's switch
+   * Only used as a fallback if WebSocket is not available
+   */
+  private async resetDeadManSwitchREST(): Promise<void> {
     try {
       const response = await this.api.setCancelAllAfter(DEAD_MAN_SWITCH_TIMEOUT);
-      this.logger.debug(`Dead man's switch reset: ${response.message}`);
+      this.logger.debug(`Dead man's switch reset via REST API: ${response.message}`);
     } catch (error) {
-      this.logger.error(`Failed to reset dead man's switch: ${error}`);
+      this.logger.error(`Failed to reset dead man's switch via REST API: ${error}`);
     }
   }
 
   private stopDeadManSwitch(): void {
+    // Don't do anything if dead man's switch is disabled in configuration
+    if (!DEAD_MAN_SWITCH_ENABLED) {
+      return;
+    }
+    
+    // Clear the interval that refreshes the dead man's switch
     if (this.deadManSwitchIntervalId) {
       clearInterval(this.deadManSwitchIntervalId);
       this.deadManSwitchIntervalId = null;
+      
+      // Also disable the dead man's switch on the WebSocket if available
+      const websocket = this.stateManager.getWebSocket();
+      if (websocket) {
+        websocket.setDeadManSwitch(null); // Passing null disables the switch
+      }
+      
       this.logger.info('Dead man\'s switch stopped');
     }
   }

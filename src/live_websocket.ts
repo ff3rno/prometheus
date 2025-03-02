@@ -1,5 +1,5 @@
 import WS from 'ws';
-import { BITMEX_WS_API_URL } from './constants';
+import { BITMEX_WS_API_URL, DEAD_MAN_SWITCH_ENABLED } from './constants';
 import { BitMEXTrade } from './types';
 import { LiveOrderManager } from './live_order_manager';
 import { StatsLogger } from './logger';
@@ -28,6 +28,7 @@ export class LiveWebSocket {
   private apiKey: string;
   private apiSecret: string;
   private symbol: string;
+  private isDeadManSwitchEnabled: boolean = false;
 
   constructor(
     orderManager: LiveOrderManager, 
@@ -117,6 +118,11 @@ export class LiveWebSocket {
         args: ['order:' + this.symbol]
       }));
       this.logger.info(`Requested current order state for ${this.symbol}`);
+      
+      // Re-enable dead man's switch if it was enabled before and it's enabled in configuration
+      if (DEAD_MAN_SWITCH_ENABLED && this.isDeadManSwitchEnabled) {
+        this.setDeadManSwitch();
+      }
     } else {
       // Unauthenticated connection - only subscribe to public trade data
       this.ws.send(JSON.stringify({
@@ -291,5 +297,55 @@ export class LiveWebSocket {
     
     // Close the connection
     this.ws.close();
+  }
+  
+  /**
+   * Set the dead man's switch via WebSocket to cancel all orders after the specified timeout
+   * @param timeoutMs Timeout in milliseconds after which all orders will be canceled (default: null to disable)
+   * @returns Promise that resolves when the dead man's switch has been set
+   */
+  public setDeadManSwitch(timeoutMs: number | null = null): void {
+    // If dead man's switch is disabled in configuration, do nothing
+    if (!DEAD_MAN_SWITCH_ENABLED) {
+      if (timeoutMs !== null) {
+        this.logger.debug('Dead man\'s switch is disabled in configuration - ignoring request to enable');
+      }
+      return;
+    }
+    
+    if (!this.apiKey || !this.apiSecret) {
+      this.logger.warn('Cannot set dead man\'s switch: no API credentials');
+      return;
+    }
+    
+    if (this.ws.readyState !== WS.OPEN) {
+      this.logger.warn('Cannot set dead man\'s switch: WebSocket not connected');
+      this.isDeadManSwitchEnabled = timeoutMs !== null;
+      return;
+    }
+    
+    try {
+      if (timeoutMs === null) {
+        // Disable the dead man's switch
+        this.ws.send(JSON.stringify({
+          op: 'cancelAllAfter',
+          args: 0
+        }));
+        this.logger.info('Dead man\'s switch disabled');
+        this.isDeadManSwitchEnabled = false;
+      } else {
+        // Convert milliseconds to seconds (WebSocket API expects seconds)
+        const timeoutSec = Math.floor(timeoutMs / 1000);
+        
+        this.ws.send(JSON.stringify({
+          op: 'cancelAllAfter',
+          args: timeoutSec
+        }));
+        this.logger.debug(`Dead man's switch set: all orders will be canceled after ${timeoutSec} seconds of inactivity`);
+        this.isDeadManSwitchEnabled = true;
+      }
+    } catch (error) {
+      this.logger.error(`Failed to set dead man's switch: ${error}`);
+    }
   }
 } 

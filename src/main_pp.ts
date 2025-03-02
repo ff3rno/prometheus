@@ -7,6 +7,7 @@ import { LiveWebSocket } from './live_websocket';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
 import { MetricsManager, MetricsConfig } from './metrics_manager';
+import { DEAD_MAN_SWITCH_ENABLED, DEAD_MAN_SWITCH_TIMEOUT } from './constants';
 
 // Load environment variables
 dotenv.config();
@@ -42,6 +43,13 @@ const run = async (): Promise<void> => {
     // Log configuration details
     logger.info(`Trading symbol: ${SYMBOL}`);
     logger.info(`Data directory: ${DATA_DIR}`);
+    
+    // Log dead man's switch status
+    if (DEAD_MAN_SWITCH_ENABLED) {
+      logger.info(`Dead man's switch: ENABLED (timeout: ${DEAD_MAN_SWITCH_TIMEOUT / 1000} seconds)`);
+    } else {
+      logger.warn('Dead man\'s switch: DISABLED');
+    }
     
     if (DRY_RUN) {
       logger.warn('RUNNING IN DRY RUN MODE - NO REAL ORDERS WILL BE PLACED');
@@ -107,6 +115,9 @@ const run = async (): Promise<void> => {
     
     // Initialize the WebSocket connection
     const websocket = new LiveWebSocket(orderManager, logger, API_KEY, API_SECRET, SYMBOL);
+    
+    // Store WebSocket reference in state manager for dead man's switch
+    stateManager.setWebSocket(websocket);
     
     // Handle process termination signals
     const handleShutdown = async (signal: string) => {
