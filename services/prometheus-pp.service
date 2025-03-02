@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=f3rno
+User=ubuntu
 WorkingDirectory=/home/ubuntu/prometheus
 ExecStart=/usr/bin/node dist/main_pp.js
 Restart=on-failure
