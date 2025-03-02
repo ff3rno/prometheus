@@ -38,11 +38,6 @@ export class MetricsManager {
     
     if (this.config.enabled && this.config.host) {
       try {
-        if (!this.config.token) {
-          this.logger.error('InfluxDB token is missing');
-          return;
-        }
-        
         this.logger.info(`Initializing InfluxDB client: ${this.config.host} (${this.database})`);
         
         this.client = new InfluxDBClient({
@@ -391,7 +386,7 @@ export class MetricsManager {
    * Attempts to reconnect to InfluxDB if the connection is lost
    */
   private reinitializeConnection(): void {
-    if (!this.config.host || !this.config.token) return;
+    if (!this.config.host) return;
     
     try {
       this.logger.info(`Attempting to reconnect to InfluxDB: ${this.config.host}`);
