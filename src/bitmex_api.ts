@@ -490,6 +490,27 @@ export class BitMEXAPI {
   }
 
   /**
+   * Sets the dead man's switch to cancel all orders after a specified timeout
+   * @param timeout Timeout in milliseconds after which all orders will be canceled
+   */
+  async setCancelAllAfter(timeout: number): Promise<{ cancelTime: string; message: string }> {
+    try {
+      // Convert milliseconds to seconds as the API expects seconds
+      const timeoutSec = Math.floor(timeout / 1000);
+      
+      const response = await this.makeRequest('POST', '/api/v1/order/cancelAllAfter', {
+        timeout: timeoutSec
+      });
+      
+      this.logger.info(`Dead man's switch set: all orders will be canceled after ${timeoutSec} seconds of inactivity`);
+      return response;
+    } catch (error) {
+      this.logger.error(`Failed to set dead man's switch: ${error}`);
+      throw error;
+    }
+  }
+
+  /**
    * Fetch historical trades for ATR calculation
    * @param symbol The trading symbol
    * @param lookbackMinutes How many minutes to look back

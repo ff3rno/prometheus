@@ -6,6 +6,12 @@ export const ORDER_COUNT = 10 // Number of orders on each side
 export const ORDER_DISTANCE = 100 // Distance between each order in USD
 export const ORDER_SIZE = 0.005 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts)
 
+// Safety measures
+export const MAX_POSITION_SIZE_BTC = 0.1 // Maximum allowed position size in BTC
+export const MAX_OPEN_ORDERS = 40 // Maximum number of open orders allowed
+export const DEAD_MAN_SWITCH_INTERVAL = 1000 * 60 * 1 // Reset dead man's switch every minute
+export const DEAD_MAN_SWITCH_TIMEOUT = 1000 * 60 * 2 // Cancel all orders after 2 minutes of inactivity
+
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation
 export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing

@@ -1,4 +1,29 @@
-import { ORDER_SIZE, ORDER_COUNT, ORDER_DISTANCE, FEE_RATE, getNextOrderId, ORDER_SYNC_INTERVAL, ENFORCE_ORDER_DISTANCE, ATR_PERIOD, ATR_MULTIPLIER, ATR_MINIMUM_GRID_DISTANCE, ATR_MAXIMUM_GRID_DISTANCE, ATR_RECALCULATION_INTERVAL, ATR_HISTORICAL_TRADES_LOOKBACK } from './constants';
+import { 
+  ORDER_COUNT, 
+  ORDER_DISTANCE, 
+  ORDER_SIZE, 
+  ATR_PERIOD, 
+  ATR_MULTIPLIER, 
+  ATR_MINIMUM_GRID_DISTANCE, 
+  ATR_MAXIMUM_GRID_DISTANCE,
+  ATR_RECALCULATION_INTERVAL,
+  ATR_HISTORICAL_TRADES_LOOKBACK,
+  TREND_RSI_PERIOD,
+  TREND_FAST_EMA_PERIOD,
+  TREND_SLOW_EMA_PERIOD,
+  TREND_RSI_OVERBOUGHT,
+  TREND_RSI_OVERSOLD,
+  TREND_MAX_ASYMMETRY,
+  TREND_MIN_ASYMMETRY,
+  ORDER_SYNC_INTERVAL,
+  MAX_POSITION_SIZE_BTC,
+  MAX_OPEN_ORDERS,
+  DEAD_MAN_SWITCH_INTERVAL,
+  DEAD_MAN_SWITCH_TIMEOUT,
+  FEE_RATE,
+  ENFORCE_ORDER_DISTANCE,
+  getNextOrderId
+} from './constants';
 import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
 
 import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument, Candle, GridSizingConfig } from './types';
@@ -26,6 +51,7 @@ export class LiveOrderManager {
   private atrRecalculationIntervalId: NodeJS.Timeout | null = null;
   private atrInstance: any; // bfx-hf-indicators ATR instance
   private trendAnalyzer: TrendAnalyzer;
+  private deadManSwitchIntervalId: NodeJS.Timeout | null = null;
   private gridSizing: GridSizingConfig = {
     useATR: true,
     currentDistance: ORDER_DISTANCE,
@@ -61,67 +87,51 @@ export class LiveOrderManager {
    * Initialize the live order manager with saved state if available
    */
   async initialize(): Promise<void> {
-    // First, fetch instrument information
     try {
+      // Get instrument info
       this.instrumentInfo = await this.api.getInstrument(this.symbol);
-      if (this.instrumentInfo) {
-        this.logger.success(`Loaded instrument details for ${this.symbol}: lotSize=${this.instrumentInfo.lotSize}, tickSize=${this.instrumentInfo.tickSize}`);
-      } else {
-        this.logger.error(`Failed to load instrument details for ${this.symbol}`);
-        // If we're not in dry run mode, this is a critical error
-        if (!this.isDryRun) {
-          throw new Error(`Cannot trade without instrument details for ${this.symbol}`);
+      
+      if (!this.instrumentInfo) {
+        throw new Error(`Could not get instrument info for ${this.symbol}`);
+      }
+      
+      // Initialize trend analyzer
+      this.trendAnalyzer = new TrendAnalyzer(this.logger);
+      
+      // Load state from state manager
+      const savedState = this.stateManager.getState();
+      
+      if (savedState) {
+        // Restore grid settings
+        this.gridSizing = savedState.gridSizing || this.gridSizing;
+        
+        // Restore order history if present
+        if (savedState.completedTrades && Array.isArray(savedState.completedTrades)) {
+          this.completedTrades = savedState.completedTrades;
+          this.logger.info(`Loaded ${this.completedTrades.length} completed trades from state`);
         }
-      }
-    } catch (error) {
-      this.logger.error(`Error fetching instrument details: ${error}`);
-      if (!this.isDryRun) {
-        throw error;
-      }
-    }
-    
-    // Initialize ATR indicator
-    this.atrInstance = new ATR([ATR_PERIOD]);
-    
-    // Load state
-    const state = this.stateManager.getState();
-    if (state) {
-      this.activeOrders = state.activeOrders || [];
-      this.completedTrades = state.completedTrades || [];
-      this.referencePrice = state.referencePrice || 0;
-      
-      // Load grid sizing config if available
-      if (state.gridSizing) {
-        this.gridSizing = state.gridSizing;
-        this.logger.info(`Loaded grid sizing configuration: distance=${this.gridSizing.currentDistance}, lastATR=${this.gridSizing.lastATRValue}`);
+        
+        this.logger.info('Restored previous state');
+        this.logger.info(`Grid distance: ${this.gridSizing.currentDistance.toFixed(2)}`);
       }
       
-      if (this.activeOrders.length > 0) {
-        this.gridInitialized = true;
-        this.logger.setStatus(`GRID ACTIVE (${this.activeOrders.length} orders)`);
-        this.logger.success(`Loaded existing grid with ${this.activeOrders.length} orders`);
-      }
-    }
-    
-    // If in dry run mode, skip API syncing
-    if (this.isDryRun) {
-      this.logger.warn('Running in DRY RUN mode - no real orders will be placed');
-      return;
-    }
-    
-    // Compare local state with actual BitMEX orders
-    await this.syncWithExchangeOrders();
-    
-    // Start periodic sync
-    if (!this.isDryRun) {
+      // Sync with existing orders on the exchange
+      await this.syncWithExchangeOrders();
+      
+      // Start periodic sync
       this.startPeriodicSync();
+      
+      // Initialize ATR recalculation
+      this.startATRRecalculationInterval();
+      
+      // Initialize the dead man's switch
+      this.startDeadManSwitch();
+      
+      this.logger.success('Order manager initialized');
+    } catch (error) {
+      this.logger.error(`Failed to initialize order manager: ${error}`);
+      throw error;
     }
-    
-    // Initially fetch and calculate ATR
-    await this.calculateATRAndUpdateGridSpacing();
-    
-    // Start ATR recalculation interval
-    this.startATRRecalculationInterval();
   }
 
   /**
@@ -397,64 +407,72 @@ export class LiveOrderManager {
    * Create an order and place it on the exchange
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
-    // Ensure price is rounded to the instrument's tick size
-    price = this.roundPriceToTickSize(price);
+    // Round price to tick size
+    const roundedPrice = this.roundPriceToTickSize(price);
     
-    // Round opposite order price if provided
-    if (oppositeOrderPrice !== null) {
-      oppositeOrderPrice = this.roundPriceToTickSize(oppositeOrderPrice);
+    // Check if we would exceed the maximum number of open orders
+    if (this.wouldExceedOrderLimit()) {
+      this.logger.warn(`Maximum open orders limit reached (${MAX_OPEN_ORDERS}). Cannot create new ${side} order at ${roundedPrice}`);
+      throw new Error(`Maximum open orders limit (${MAX_OPEN_ORDERS}) reached`);
     }
     
-    const fee = price * size * (FEE_RATE / 100);
-    
-    // Calculate contract quantity for FFWCSX instruments, respecting lot size
-    const contractQty = this.calculateContractQty(size, price);
-    
-    // Adjust BTC size to match the exact contract quantity
-    // This ensures our internal accounting matches what's on the exchange
-    let adjustedSize = size;
-    if (this.symbol.includes('USD') && price > 0) {
-      adjustedSize = contractQty / price;
+    // Check if we would exceed the maximum position size
+    const exceedsPositionLimit = await this.wouldExceedPositionLimit(size, side);
+    if (exceedsPositionLimit) {
+      this.logger.warn(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded. Cannot create new ${side} order at ${roundedPrice}`);
+      throw new Error(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded`);
     }
     
+    // Calculate fees - BitMEX charges fees on the value (price * quantity)
+    const feeRate = FEE_RATE / 100; // Convert from percentage to decimal
+    const fee = roundedPrice * size * feeRate;
+    
+    // Calculate contract quantity for BitMEX
+    const contractQty = this.calculateContractQty(size, roundedPrice);
+    
+    // Create new order object
     const order: Order = {
       id: getNextOrderId(),
-      price,
-      size: adjustedSize, // Size in BTC (adjusted to match contract qty)
-      contractQty, // Size in contracts
+      price: roundedPrice,
+      size,
+      contractQty,
       side,
       fee,
       oppositeOrderPrice,
       filled: false
     };
     
-    // In dry run mode, just add the order locally
+    // If in dry run mode, just add to local orders
     if (this.isDryRun) {
       this.activeOrders.push(order);
-      this.logger.setActiveOrders(this.activeOrders.length);
-      this.logger.info(`[DRY RUN] Created ${side.toUpperCase()} order #${order.id}: ${adjustedSize.toFixed(8)} BTC (${contractQty} contracts) @ $${price.toFixed(2)}, FEE: $${fee.toFixed(4)}`);
+      this.logger.info(`[DRY RUN] Created ${side} order: ${size} BTC @ $${roundedPrice}`);
       return order;
     }
     
-    // Place order on BitMEX
     try {
-      const bitmexSide = side === 'buy' ? 'Buy' : 'Sell';
-      const response = await this.api.placeLimitOrder(bitmexSide, price, adjustedSize, this.symbol);
+      // Place the order on BitMEX
+      const bitmexOrder = await this.api.placeLimitOrder(
+        side === 'buy' ? 'Buy' : 'Sell', 
+        roundedPrice, 
+        size,
+        this.symbol
+      );
       
-      // Store BitMEX order ID with our local order
-      order.bitmexOrderId = response.orderID;
+      // Update order with BitMEX order ID
+      order.bitmexOrderId = bitmexOrder.orderID;
       
+      // Add to active orders
       this.activeOrders.push(order);
-      this.logger.setActiveOrders(this.activeOrders.length);
-      
-      this.logger.success(`Created ${side.toUpperCase()} order #${order.id}: ${adjustedSize.toFixed(8)} BTC (${contractQty} contracts) @ $${price.toFixed(2)}, BitMEX ID: ${order.bitmexOrderId}`);
       
       // Update state
-      this.stateManager.updateActiveOrders(this.activeOrders);
+      await this.stateManager.updateActiveOrders(this.activeOrders);
+      
+      // Log order creation
+      this.logger.success(`Created ${side} order: ${size} BTC @ $${roundedPrice} [${order.bitmexOrderId}]`);
       
       return order;
     } catch (error) {
-      this.logger.error(`Failed to place ${side} order at ${price}: ${error}`);
+      this.logger.error(`Failed to create ${side} order at ${roundedPrice}: ${error}`);
       throw error;
     }
   }
@@ -1119,6 +1137,17 @@ export class LiveOrderManager {
   public cleanup(): void {
     this.stopPeriodicSync();
     this.stopATRRecalculationInterval();
+    this.stopDeadManSwitch();
+    
+    // Save final state
+    if (this.stateManager) {
+      this.stateManager.updateActiveOrders(this.activeOrders);
+      this.stateManager.updateCompletedTrades(this.completedTrades);
+      this.stateManager.updateReferencePrice(this.referencePrice);
+      this.stateManager.updateGridSizing(this.gridSizing);
+      this.stateManager.saveState();
+    }
+    
     this.logger.info('Order manager resources cleaned up');
   }
 
@@ -1445,5 +1474,90 @@ export class LiveOrderManager {
     } else {
       return this.gridSizing.upwardGridSpacing || this.gridSizing.currentDistance;
     }
+  }
+
+  private startDeadManSwitch(): void {
+    // Skip in dry run mode
+    if (this.isDryRun) {
+      this.logger.info('Dead man\'s switch disabled in dry run mode');
+      return;
+    }
+    
+    // Set the initial dead man's switch
+    this.resetDeadManSwitch();
+    
+    // Set up interval to periodically reset the dead man's switch
+    this.deadManSwitchIntervalId = setInterval(() => {
+      this.resetDeadManSwitch();
+    }, DEAD_MAN_SWITCH_INTERVAL);
+    
+    this.logger.info(`Dead man's switch initialized: will cancel all orders after ${DEAD_MAN_SWITCH_TIMEOUT / 1000} seconds of inactivity`);
+  }
+
+  private async resetDeadManSwitch(): Promise<void> {
+    try {
+      const response = await this.api.setCancelAllAfter(DEAD_MAN_SWITCH_TIMEOUT);
+      this.logger.debug(`Dead man's switch reset: ${response.message}`);
+    } catch (error) {
+      this.logger.error(`Failed to reset dead man's switch: ${error}`);
+    }
+  }
+
+  private stopDeadManSwitch(): void {
+    if (this.deadManSwitchIntervalId) {
+      clearInterval(this.deadManSwitchIntervalId);
+      this.deadManSwitchIntervalId = null;
+      this.logger.info('Dead man\'s switch stopped');
+    }
+  }
+
+  /**
+   * Checks if creating a new order would exceed the maximum position size
+   * @param size The size of the potential new order in BTC
+   * @param side The side of the potential new order
+   * @returns Boolean indicating if the position limit would be exceeded
+   */
+  private async wouldExceedPositionLimit(size: number, side: 'buy' | 'sell'): Promise<boolean> {
+    // In dry run mode, allow all orders
+    if (this.isDryRun) {
+      return false;
+    }
+    
+    try {
+      // Get current position
+      const position = await this.api.getPosition(this.symbol);
+      
+      if (!position) {
+        // No position, so we're safe
+        return false;
+      }
+      
+      // Current position in BTC
+      const currentPositionBTC = Math.abs(position.currentQty) / (this.currentMarketPrice || 1);
+      
+      // For buy orders, check if adding to long position would exceed limit
+      if (side === 'buy' && position.currentQty >= 0) {
+        return currentPositionBTC + size > MAX_POSITION_SIZE_BTC;
+      }
+      
+      // For sell orders, check if adding to short position would exceed limit
+      if (side === 'sell' && position.currentQty <= 0) {
+        return currentPositionBTC + size > MAX_POSITION_SIZE_BTC;
+      }
+      
+      // Order reduces position size, so it's always safe
+      return false;
+    } catch (error) {
+      this.logger.error(`Error checking position limits: ${error}`);
+      // If we can't verify, be conservative and prevent the order
+      return true;
+    }
+  }
+
+  /**
+   * Checks if the number of open orders would exceed the maximum allowed
+   */
+  private wouldExceedOrderLimit(): boolean {
+    return this.activeOrders.length >= MAX_OPEN_ORDERS;
   }
 } 
