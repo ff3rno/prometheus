@@ -10,6 +10,11 @@ export interface Order {
   filled: boolean // Whether the order has been filled
   entryPrice?: number // Price at which the order entered the market (for tracking profit)
   bitmexOrderId?: string // BitMEX order ID for tracking real orders
+  entryTimestamp?: number // When this order was created
+  fillTimestamp?: number // When this order was filled
+  isEntryOrder?: boolean // Whether this order is an entry (starting a new position)
+  entryOrderId?: number // Reference to the entry order by ID (for exit orders)
+  exitOrderId?: number // Reference to the exit order by ID (for entry orders)
 }
 
 // Completed trade interface

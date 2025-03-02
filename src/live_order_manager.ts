@@ -521,6 +521,7 @@ export class LiveOrderManager {
     
     // Mark the order as filled
     order.filled = true;
+    order.fillTimestamp = Date.now();
     
     // Contract quantity string for logging
     const contractQtyStr = order.contractQty ? ` (${order.contractQty} contracts)` : '';
@@ -570,40 +571,45 @@ export class LiveOrderManager {
     // Create a new order in the opposite direction
     const newOrder = await this.createOrder(newPrice, order.size, newSide, null);
     
-    // For sell orders created after buy fills, set the entry price to track profit
+    // For sell orders created after buy fills, set the entry price and link orders
     if (newSide === 'sell') {
       newOrder.entryPrice = executionPrice;
+      newOrder.entryOrderId = order.id; // Link to entry order
+      order.exitOrderId = newOrder.id; // Link entry to its exit
     }
     
     this.logger.info(`Placed opposing ${newSide.toUpperCase()} order #${newOrder.id} at $${newPrice.toFixed(2)} (${gridSpacing.toFixed(2)} ${order.side === 'buy' ? 'above' : 'below'} fill price)`);
     
-    // Try to find a matching order that completes a trade cycle
-    if (order.oppositeOrderPrice !== null && order.oppositeOrderPrice !== undefined) {
-      // This is an exit order filling from a previous entry
-      this.logger.info(`Order #${order.id} completes a trade cycle with oppositeOrderPrice ${order.oppositeOrderPrice}`);
-      
-      // Find the entry order in completed orders
-      const entryOrder = this.activeOrders.find(o => 
-        o.filled && 
-        ((order.side === 'buy' && o.side === 'sell') || (order.side === 'sell' && o.side === 'buy')) &&
-        Math.abs(o.price - order.oppositeOrderPrice!) < 0.01
-      );
+    // Determine if this order is potentially an exit order completing a round-trip trade
+    // Buy orders can be exits for previous sells, and sells can be exits for previous buys
+    let isExitOrder = false;
+    
+    // For buy orders, they're exits if they have an entryOrderId or oppositeOrderPrice
+    if (order.side === 'buy' && (order.entryOrderId || order.oppositeOrderPrice !== null)) {
+      isExitOrder = true;
+    }
+    // For sell orders, they're exits if they have an entryOrderId or oppositeOrderPrice
+    // AND they're not freshly created from a buy (ie. not an entry from a filled buy)
+    else if (order.side === 'sell' && (order.entryOrderId || order.oppositeOrderPrice !== null)) {
+      isExitOrder = true;
+    }
+    
+    // If this is an exit order, try to find the matching entry
+    if (isExitOrder) {
+      // Use our improved entry finding algorithm
+      const entryOrder = this.findMatchingEntryOrder(order);
       
       if (entryOrder) {
         // Calculate profit/loss
         let profit = 0;
-        let entryPrice = 0;
-        let exitPrice = 0;
+        let entryPrice = entryOrder.price;
+        let exitPrice = executionPrice;
         
         if (order.side === 'buy') {
           // Sell -> Buy cycle
-          entryPrice = entryOrder.price;
-          exitPrice = executionPrice;
           profit = (entryPrice - exitPrice) * order.size;
         } else {
           // Buy -> Sell cycle
-          entryPrice = entryOrder.price;
-          exitPrice = executionPrice;
           profit = (exitPrice - entryPrice) * order.size;
         }
         
@@ -611,9 +617,20 @@ export class LiveOrderManager {
         const totalFees = entryOrder.fee + order.fee;
         const netProfit = profit - totalFees;
         
+        // Create a link between these orders if not already linked
+        if (!order.entryOrderId) {
+          order.entryOrderId = entryOrder.id;
+        }
+        if (!entryOrder.exitOrderId) {
+          entryOrder.exitOrderId = order.id;
+        }
+        
         // Log the completed trade
         const profitStr = netProfit >= 0 ? '+' : '';
-        this.logger.star(`COMPLETED TRADE: ${entryOrder.side.toUpperCase()} @ $${entryPrice.toFixed(2)} -> ${order.side.toUpperCase()} @ $${exitPrice.toFixed(2)}, Profit: ${profitStr}$${netProfit.toFixed(4)} (Fees: $${totalFees.toFixed(4)})`);
+        const durationMs = (order.fillTimestamp || 0) - (entryOrder.fillTimestamp || 0);
+        const durationHours = durationMs / (1000 * 60 * 60);
+        
+        this.logger.star(`COMPLETED TRADE: ${entryOrder.side.toUpperCase()} @ $${entryPrice.toFixed(2)} -> ${order.side.toUpperCase()} @ $${exitPrice.toFixed(2)}, Profit: ${profitStr}$${netProfit.toFixed(4)} (Fees: $${totalFees.toFixed(4)}, Duration: ${durationHours.toFixed(2)}h)`);
         
         // Record the trade in the completed trades list
         this.completedTrades.push({
@@ -638,7 +655,7 @@ export class LiveOrderManager {
         
         // If metrics are enabled, record the completed trade
         if (this.metricsManager) {
-          this.logger.debug(`Recording trade metrics: profit=${netProfit}, fees=${totalFees}, size=${order.size}`);
+          this.logger.debug(`Recording trade metrics: profit=${netProfit}, fees=${totalFees}, size=${order.size}, entry=${entryPrice}, exit=${exitPrice}`);
           
           try {
             this.metricsManager.recordTrade(
@@ -686,6 +703,9 @@ export class LiveOrderManager {
             this.logger.error(`Failed to record grid stats: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
+      } else {
+        // If no matching entry was found, log it but don't create a trade record
+        this.logger.warn(`No matching entry order found for ${order.side} order #${order.id} at ${order.price}. Cannot record round-trip trade.`);
       }
     }
     
@@ -797,7 +817,8 @@ export class LiveOrderManager {
         }
         
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-        await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
+        const buyOrder = await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
+        buyOrder.isEntryOrder = true; // Buy orders are entries
       }
       
       // Create sell orders above the mid price with asymmetric spacing
@@ -807,10 +828,11 @@ export class LiveOrderManager {
         // Round the sell price to the instrument's tick size
         const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-        const order = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
+        const sellOrder = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
         // For sell orders, set the entry price to the current mid price
         // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
-        order.entryPrice = this.referencePrice;
+        sellOrder.entryPrice = this.referencePrice;
+        sellOrder.isEntryOrder = true; // Initial sells are also entries since they don't have matching buys yet
       }
       
       // Calculate the total grid cost (capital required)
@@ -973,6 +995,9 @@ export class LiveOrderManager {
       }
       
       this.logger.star(`Received fill notification for order ${orderID} (local ID: ${matchingOrder.id})`);
+      
+      // Set the fill timestamp for accurate duration tracking
+      matchingOrder.fillTimestamp = Date.now();
       
       // Mark this order as processed before doing the actual processing
       // This prevents issues if fillOrder results in state changes that trigger more operations
@@ -1153,7 +1178,11 @@ export class LiveOrderManager {
             
             if (side === 'sell') {
               order.entryPrice = this.referencePrice;
+              order.isEntryOrder = true; // These are new entry orders
+            } else {
+              order.isEntryOrder = true; // Buy orders are entry orders
             }
+            
             this.logger.success(`Placed gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)}`);
             
             // Sleep briefly between order placements to avoid rate limits
@@ -1206,10 +1235,11 @@ export class LiveOrderManager {
             }
             
             try {
-              await this.createOrder(price, ORDER_SIZE, 'buy', null);
+              const buyOrder = await this.createOrder(price, ORDER_SIZE, 'buy', null);
               // Add the new price point to our set to prevent duplicates in the same batch
               existingPricePoints.add(price);
               
+              buyOrder.isEntryOrder = true; // Buy orders are entry orders
               this.logger.success(`Placed gap-filling BUY order at ${price.toFixed(2)}`);
               
               // Sleep briefly between order placements
@@ -1261,6 +1291,7 @@ export class LiveOrderManager {
               existingPricePoints.add(price);
               
               order.entryPrice = this.referencePrice;
+              order.isEntryOrder = true; // These are new entry orders
               this.logger.success(`Placed gap-filling SELL order at ${price.toFixed(2)}`);
               
               // Sleep briefly between order placements
@@ -1937,6 +1968,7 @@ export class LiveOrderManager {
         try {
           const order = await this.createOrder(roundedSellPrice, BASE_ORDER_SIZE, 'sell', null);
           order.entryPrice = this.referencePrice;
+          order.isEntryOrder = true; // These are new entry orders (not matched to buys)
           this.logger.success(`Created new sell order at ${roundedSellPrice} as part of grid shift`);
           
           // Brief delay to avoid rate limits
@@ -1957,7 +1989,8 @@ export class LiveOrderManager {
         const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
         
         try {
-          await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
+          const order = await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
+          order.isEntryOrder = true; // New buy orders are entry orders
           this.logger.success(`Created new buy order at ${roundedBuyPrice} as part of grid shift`);
           
           // Brief delay to avoid rate limits
@@ -1981,5 +2014,64 @@ export class LiveOrderManager {
     }
     
     this.logger.star(`Grid successfully shifted ${direction.toUpperCase()}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+  }
+
+  /**
+   * Find a matching entry order for a filled exit order
+   * This uses multiple strategies to find the best match, even if grid has shifted
+   */
+  private findMatchingEntryOrder(exitOrder: Order): Order | null {
+    // Strategy 1: Check explicit links from entryOrderId if available
+    if (exitOrder.entryOrderId) {
+      // Look for the entry order in active orders
+      const linkedEntry = this.activeOrders.find(o => 
+        o.filled && o.id === exitOrder.entryOrderId
+      );
+      
+      if (linkedEntry) {
+        this.logger.info(`Found explicitly linked entry order #${linkedEntry.id} for exit #${exitOrder.id}`);
+        return linkedEntry;
+      }
+      
+      // If not in active orders, check completed trades
+      const completedTradeWithEntry = this.completedTrades.find(t => 
+        t.entryOrder.id === exitOrder.entryOrderId
+      );
+      
+      if (completedTradeWithEntry) {
+        this.logger.info(`Found explicitly linked entry order #${completedTradeWithEntry.entryOrder.id} in completed trades`);
+        return completedTradeWithEntry.entryOrder;
+      }
+    }
+    
+    // Strategy 2: Use oppositeOrderPrice if available (legacy method)
+    if (exitOrder.oppositeOrderPrice !== null && exitOrder.oppositeOrderPrice !== undefined) {
+      const priceBasedEntry = this.activeOrders.find(o => 
+        o.filled && 
+        ((exitOrder.side === 'buy' && o.side === 'sell') || (exitOrder.side === 'sell' && o.side === 'buy')) &&
+        Math.abs(o.price - exitOrder.oppositeOrderPrice!) < 0.01
+      );
+      
+      if (priceBasedEntry) {
+        this.logger.info(`Found matching entry order #${priceBasedEntry.id} by price (${priceBasedEntry.price})`);
+        return priceBasedEntry;
+      }
+    }
+    
+    // Strategy 3: Time-based heuristics - find the most recently filled opposite order
+    // that doesn't already have an exit
+    const oppositeSide = exitOrder.side === 'buy' ? 'sell' : 'buy';
+    const potentialEntries = this.activeOrders
+      .filter(o => o.filled && o.side === oppositeSide && !o.exitOrderId)
+      .sort((a, b) => (b.fillTimestamp || 0) - (a.fillTimestamp || 0)); // Most recent first
+    
+    if (potentialEntries.length > 0) {
+      const heuristicMatch = potentialEntries[0];
+      this.logger.info(`Using most recent ${oppositeSide} order #${heuristicMatch.id} as entry for ${exitOrder.side} #${exitOrder.id} (heuristic match)`);
+      return heuristicMatch;
+    }
+    
+    // No matching entry found
+    return null;
   }
 } 
