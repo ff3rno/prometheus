@@ -9,9 +9,6 @@ export const ORDER_SIZE = 0.007 // Size of each order in BTC (for FFWCSX instrum
 // Safety measures
 export const MAX_POSITION_SIZE_BTC = 0.1 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 30 // Maximum number of open orders allowed
-export const DEAD_MAN_SWITCH_ENABLED = false // Whether to enable the dead man's switch functionality
-export const DEAD_MAN_SWITCH_INTERVAL = 1000 * 60 * 1 // Reset dead man's switch every minute
-export const DEAD_MAN_SWITCH_TIMEOUT = 1000 * 60 * 2 // Cancel all orders after 2 minutes of inactivity
 
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation

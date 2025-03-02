@@ -1,38 +1,10 @@
-import { 
-  ORDER_COUNT, 
-  ORDER_DISTANCE, 
-  ORDER_SIZE, 
-  ATR_PERIOD, 
-  ATR_MULTIPLIER, 
-  ATR_MINIMUM_GRID_DISTANCE, 
-  ATR_MAXIMUM_GRID_DISTANCE,
-  ATR_RECALCULATION_INTERVAL,
-  ATR_HISTORICAL_TRADES_LOOKBACK,
-  TREND_RSI_PERIOD,
-  TREND_FAST_EMA_PERIOD,
-  TREND_SLOW_EMA_PERIOD,
-  TREND_RSI_OVERBOUGHT,
-  TREND_RSI_OVERSOLD,
-  TREND_MAX_ASYMMETRY,
-  TREND_MIN_ASYMMETRY,
-  ORDER_SYNC_INTERVAL,
-  MAX_POSITION_SIZE_BTC,
-  MAX_OPEN_ORDERS,
-  DEAD_MAN_SWITCH_INTERVAL,
-  DEAD_MAN_SWITCH_TIMEOUT,
-  FEE_RATE,
-  ENFORCE_ORDER_DISTANCE,
-  getNextOrderId,
-  DEAD_MAN_SWITCH_ENABLED,
-  GAP_DETECTION_TOLERANCE
-} from './constants';
-import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
-
-import { Order, CompletedTrade, BitMEXTrade, BitMEXOrder, BitMEXInstrument, Candle, GridSizingConfig } from './types';
-import { StatsLogger } from './logger';
+import { Order, CompletedTrade, BitMEXInstrument, BitMEXOrder, BitMEXTrade, BitMEXPosition, GridSizingConfig, Candle } from './types';
 import { BitMEXAPI } from './bitmex_api';
+import { StatsLogger } from './logger';
 import { StateManager } from './state_manager';
+import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
 import { MetricsManager } from './metrics_manager';
+import { ORDER_DISTANCE, ORDER_COUNT, ORDER_SIZE, MAX_POSITION_SIZE_BTC, MAX_OPEN_ORDERS, ENFORCE_ORDER_DISTANCE, ATR_PERIOD, ATR_MULTIPLIER, ATR_MINIMUM_GRID_DISTANCE, ATR_MAXIMUM_GRID_DISTANCE, ATR_RECALCULATION_INTERVAL, ATR_HISTORICAL_TRADES_LOOKBACK, ORDER_SYNC_INTERVAL, GAP_DETECTION_TOLERANCE, getNextOrderId, FEE_RATE } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
 export class LiveOrderManager {
@@ -53,7 +25,6 @@ export class LiveOrderManager {
   private atrRecalculationIntervalId: NodeJS.Timeout | null = null;
   private atrInstance: any; // bfx-hf-indicators ATR instance
   private trendAnalyzer: TrendAnalyzer;
-  private deadManSwitchIntervalId: NodeJS.Timeout | null = null;
   private gridSizing: GridSizingConfig = {
     useATR: true,
     currentDistance: ORDER_DISTANCE,
@@ -128,9 +99,6 @@ export class LiveOrderManager {
       
       // Initialize ATR recalculation
       this.startATRRecalculationInterval();
-      
-      // Initialize the dead man's switch
-      this.startDeadManSwitch();
       
       this.logger.success('Order manager initialized');
     } catch (error) {
@@ -1215,7 +1183,6 @@ export class LiveOrderManager {
   public cleanup(): void {
     this.stopPeriodicSync();
     this.stopATRRecalculationInterval();
-    this.stopDeadManSwitch();
     
     // Save final state
     if (this.stateManager) {
@@ -1551,78 +1518,6 @@ export class LiveOrderManager {
       return this.gridSizing.downwardGridSpacing || this.gridSizing.currentDistance;
     } else {
       return this.gridSizing.upwardGridSpacing || this.gridSizing.currentDistance;
-    }
-  }
-
-  private startDeadManSwitch(): void {
-    // Check if dead man's switch is enabled in constants
-    if (!DEAD_MAN_SWITCH_ENABLED) {
-      this.logger.info('Dead man\'s switch is disabled via configuration');
-      return;
-    }
-    
-    // Skip in dry run mode
-    if (this.isDryRun) {
-      this.logger.info('Dead man\'s switch disabled in dry run mode');
-      return;
-    }
-    
-    // Get reference to the websocket instance from main_pp.ts
-    const websocket = this.stateManager.getWebSocket();
-    
-    if (!websocket) {
-      this.logger.warn('WebSocket not available, falling back to REST API for dead man\'s switch');
-      // Set the initial dead man's switch using REST API as fallback
-      this.resetDeadManSwitchREST();
-      
-      // Set up interval to periodically reset the dead man's switch
-      this.deadManSwitchIntervalId = setInterval(() => {
-        this.resetDeadManSwitchREST();
-      }, DEAD_MAN_SWITCH_INTERVAL);
-    } else {
-      // Set the initial dead man's switch using WebSocket
-      websocket.setDeadManSwitch(DEAD_MAN_SWITCH_TIMEOUT);
-      
-      // Set up interval to periodically reset the dead man's switch
-      this.deadManSwitchIntervalId = setInterval(() => {
-        websocket.setDeadManSwitch(DEAD_MAN_SWITCH_TIMEOUT);
-      }, DEAD_MAN_SWITCH_INTERVAL);
-    }
-    
-    this.logger.info(`Dead man's switch initialized: will cancel all orders after ${DEAD_MAN_SWITCH_TIMEOUT / 1000} seconds of inactivity`);
-  }
-
-  /**
-   * Legacy method that uses REST API to set the dead man's switch
-   * Only used as a fallback if WebSocket is not available
-   */
-  private async resetDeadManSwitchREST(): Promise<void> {
-    try {
-      const response = await this.api.setCancelAllAfter(DEAD_MAN_SWITCH_TIMEOUT);
-      this.logger.debug(`Dead man's switch reset via REST API: ${response.message}`);
-    } catch (error) {
-      this.logger.error(`Failed to reset dead man's switch via REST API: ${error}`);
-    }
-  }
-
-  private stopDeadManSwitch(): void {
-    // Don't do anything if dead man's switch is disabled in configuration
-    if (!DEAD_MAN_SWITCH_ENABLED) {
-      return;
-    }
-    
-    // Clear the interval that refreshes the dead man's switch
-    if (this.deadManSwitchIntervalId) {
-      clearInterval(this.deadManSwitchIntervalId);
-      this.deadManSwitchIntervalId = null;
-      
-      // Also disable the dead man's switch on the WebSocket if available
-      const websocket = this.stateManager.getWebSocket();
-      if (websocket) {
-        websocket.setDeadManSwitch(null); // Passing null disables the switch
-      }
-      
-      this.logger.info('Dead man\'s switch stopped');
     }
   }
 

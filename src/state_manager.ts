@@ -4,7 +4,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Order, CompletedTrade, GridSizingConfig } from './types';
 import { StatsLogger } from './logger';
-import { LiveWebSocket } from './live_websocket';
 
 // Define the database schema
 interface AppState {
@@ -26,7 +25,6 @@ export class StateManager {
   private db: Low<AppState>;
   private logger: StatsLogger;
   private savePath: string;
-  private websocket: LiveWebSocket | null = null;
   
   constructor(savePath: string, logger: StatsLogger) {
     this.savePath = savePath;
@@ -207,21 +205,6 @@ export class StateManager {
    */
   getReferencePrice(): number {
     return this.db.data?.referencePrice || 0;
-  }
-  
-  /**
-   * Set the WebSocket reference
-   */
-  setWebSocket(websocket: LiveWebSocket): void {
-    this.websocket = websocket;
-    this.logger.debug('WebSocket reference set in StateManager');
-  }
-  
-  /**
-   * Get the WebSocket reference
-   */
-  getWebSocket(): LiveWebSocket | null {
-    return this.websocket;
   }
   
   /**
