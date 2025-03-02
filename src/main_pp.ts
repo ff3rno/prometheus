@@ -23,6 +23,7 @@ const INFLUX_HOST = process.env.INFLUX_HOST || '';
 const INFLUX_TOKEN = process.env.INFLUX_TOKEN || '';
 const INFLUX_DATABASE = process.env.INFLUX_DATABASE || 'prometheus_grid';
 const INFLUX_ENABLED = process.env.INFLUX_ENABLED === 'true' && !!INFLUX_HOST;
+const INFLUX_DEBUG = process.env.INFLUX_DEBUG === 'true';
 
 // Create a logger instance
 const logger = new StatsLogger('pp-live');
@@ -57,14 +58,15 @@ const run = async (): Promise<void> => {
       host: INFLUX_HOST,
       token: INFLUX_TOKEN,
       database: INFLUX_DATABASE,
-      enabled: INFLUX_ENABLED
+      enabled: INFLUX_ENABLED,
+      debug: INFLUX_DEBUG
     };
 
     // Initialize metrics manager
     let metricsManager: MetricsManager | null = null;
     
     if (INFLUX_ENABLED) {
-      logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})`);
+      logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})${INFLUX_DEBUG ? ' [DEBUG MODE]' : ''}`);
       metricsManager = new MetricsManager(logger, metricsConfig, SYMBOL);
     } else {
       logger.warn('InfluxDB metrics disabled');

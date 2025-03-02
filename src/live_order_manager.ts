@@ -97,6 +97,24 @@ export class LiveOrderManager {
       // Start periodic sync
       this.startPeriodicSync();
       
+      // Initialize periodic grid stats recording if metrics are enabled
+      if (this.metricsManager) {
+        this.metricsManager.startPeriodicGridStatsRecording(() => {
+          const totalProfit = this.completedTrades.reduce((total, trade) => total + trade.profit, 0);
+          const totalFees = this.completedTrades.reduce((total, trade) => total + trade.fees, 0);
+          const buyEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'buy').length;
+          const sellEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'sell').length;
+          
+          return {
+            totalProfit,
+            totalOrders: this.completedTrades.length,
+            buyOrders: buyEntryTrades,
+            sellOrders: sellEntryTrades,
+            totalFees
+          };
+        });
+      }
+      
       // Initialize ATR recalculation
       this.startATRRecalculationInterval();
       
@@ -579,36 +597,64 @@ export class LiveOrderManager {
         this.stateManager.updateCompletedTrades(this.completedTrades);
         this.logger.recordTrade(netProfit, totalFees, order.size);
         
+        // Calculate aggregated stats up-front
+        const totalProfit = this.completedTrades.reduce((total, trade) => total + trade.profit, 0);
+        const totalFeesPaid = this.completedTrades.reduce((total, trade) => total + trade.fees, 0);
+        const totalVolume = this.completedTrades.reduce((total, trade) => total + trade.entryOrder.size, 0);
+        const profitableTrades = this.completedTrades.filter(t => t.profit > 0).length;
+        const unprofitableTrades = this.completedTrades.filter(t => t.profit < 0).length;
+        const buyEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'buy').length;
+        const sellEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'sell').length;
+        
         // If metrics are enabled, record the completed trade
         if (this.metricsManager) {
-          this.metricsManager.recordTrade(
-            netProfit,
-            totalFees, 
-            order.size,
-            entryPrice,
-            exitPrice
-          );
+          this.logger.debug(`Recording trade metrics: profit=${netProfit}, fees=${totalFees}, size=${order.size}`);
+          
+          try {
+            this.metricsManager.recordTrade(
+              netProfit,
+              totalFees, 
+              order.size,
+              entryPrice,
+              exitPrice
+            );
+            
+            // Also record volume metrics
+            this.metricsManager.recordVolume(
+              order.size,
+              order.size * exitPrice,
+              order.side
+            );
+          } catch (error) {
+            this.logger.error(`Failed to record trade metrics: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
         
         // Update accumulated stats in state manager
         this.stateManager.updateStats(
-          this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
+          totalProfit,
           this.completedTrades.length,
-          this.completedTrades.filter(t => t.profit > 0).length,
-          this.completedTrades.filter(t => t.profit < 0).length,
-          this.completedTrades.reduce((total, trade) => total + trade.fees, 0),
-          this.completedTrades.reduce((total, trade) => total + trade.entryOrder.size, 0)
+          profitableTrades,
+          unprofitableTrades,
+          totalFeesPaid,
+          totalVolume
         );
         
         // Record grid stats metrics
         if (this.metricsManager) {
-          this.metricsManager.recordGridStats(
-            this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
-            this.completedTrades.length,
-            this.completedTrades.filter(t => t.entryOrder.side === 'buy').length,
-            this.completedTrades.filter(t => t.entryOrder.side === 'sell').length,
-            this.completedTrades.reduce((total, trade) => total + trade.fees, 0)
-          );
+          try {
+            this.logger.debug(`Recording grid stats: profit=${totalProfit}, trades=${this.completedTrades.length}, fees=${totalFeesPaid}`);
+            
+            this.metricsManager.recordGridStats(
+              totalProfit,
+              this.completedTrades.length,
+              buyEntryTrades,
+              sellEntryTrades,
+              totalFeesPaid
+            );
+          } catch (error) {
+            this.logger.error(`Failed to record grid stats: ${error instanceof Error ? error.message : String(error)}`);
+          }
         }
       }
     }
