@@ -349,6 +349,11 @@ export class BitMEXAPI {
    */
   async placeLimitOrder(side: 'Buy' | 'Sell', price: number, quantity: number, symbol: string = 'XBTUSD'): Promise<BitMEXOrder> {
     try {
+      // Validate price is positive
+      if (price <= 0) {
+        throw new Error(`Invalid price ${price} - must be positive`);
+      }
+      
       // Fetch instrument details to get the lotSize
       const instrument = await this.getInstrument(symbol);
       if (!instrument) {
@@ -365,6 +370,7 @@ export class BitMEXAPI {
         // Convert BTC quantity to contract quantity
         // For XBTUSD, 1 contract = 1 USD, so multiply by price to get equivalent contracts
         orderQty = Math.round(quantity * price);
+        this.logger.debug(`Converting ${quantity} BTC to ${orderQty} contracts at price $${price} for ${symbol}`);
       } else {
         // For other instruments, use the quantity directly
         orderQty = quantity;

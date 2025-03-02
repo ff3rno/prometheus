@@ -158,8 +158,11 @@ export class LiveOrderManager {
     
     // For XBTUSD and similar "FFWCSX" instruments, convert BTC to USD contracts
     if (this.symbol.includes('USD')) {
+      // Ensure price is positive
+      const safePrice = Math.max(price, 0.01);
+      
       // Calculate raw contract quantity (1 contract = 1 USD)
-      const rawContractQty = btcSize * price;
+      const rawContractQty = btcSize * safePrice;
       
       // Round to the instrument's lot size
       const lotSize = this.instrumentInfo.lotSize;
@@ -413,6 +416,12 @@ export class LiveOrderManager {
    * Create an order and place it on the exchange
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
+    // Validate price is positive
+    if (price <= 0) {
+      this.logger.error(`Cannot create order with invalid price: ${price}`);
+      throw new Error(`Invalid price: ${price}`);
+    }
+    
     // Round price to tick size
     const roundedPrice = this.roundPriceToTickSize(price);
     
@@ -736,12 +745,19 @@ export class LiveOrderManager {
       // Ensure the reference price is rounded to tick size
       this.referencePrice = this.roundPriceToTickSize(midPrice);
       
+      // Safety check for reference price
+      if (this.referencePrice <= 0) {
+        this.logger.error(`Cannot initialize grid with invalid reference price: ${this.referencePrice}`);
+        this._isInitializingGrid = false;
+        return;
+      }
+      
       // Get upward and downward grid spacing
       const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
       const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
       
-      // Calculate grid boundaries
-      this.gridLowerBound = this.referencePrice - (downwardGridSpacing * ORDER_COUNT);
+      // Calculate grid boundaries with safety minimum
+      this.gridLowerBound = Math.max(1, this.referencePrice - (downwardGridSpacing * ORDER_COUNT));
       this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
       
       // Log grid initialization with asymmetric spacing if applicable
@@ -764,8 +780,22 @@ export class LiveOrderManager {
       let currentBuyPrice = this.referencePrice;
       for (let i = 1; i <= ORDER_COUNT; i++) {
         currentBuyPrice -= downwardGridSpacing;
+        
+        // Ensure we don't create buy orders with negative or very low prices
+        if (currentBuyPrice <= 0) {
+          this.logger.warn(`Skipping buy order at negative price point: ${currentBuyPrice}`);
+          continue;
+        }
+        
         // Round the buy price to the instrument's tick size
         const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
+        
+        // Additional safety check
+        if (roundedBuyPrice <= 0) {
+          this.logger.warn(`Skipping buy order at invalid price point after rounding: ${roundedBuyPrice}`);
+          continue;
+        }
+        
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
         await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
       }
@@ -1691,46 +1721,41 @@ export class LiveOrderManager {
       return BASE_ORDER_SIZE;
     }
 
-    // We need reference price and grid boundaries to calculate variable sizes
-    if (this.referencePrice <= 0 || this.gridLowerBound <= 0 || this.gridUpperBound <= 0) {
+    // If reference price is not available or price is invalid, just return base size
+    if (this.referencePrice <= 0 || price <= 0) {
       return BASE_ORDER_SIZE;
     }
 
-    // Calculate relative position of price within the grid
-    const gridRange = this.gridUpperBound - this.gridLowerBound;
-    const extendedLowerBound = this.gridLowerBound - (gridRange * ORDER_SIZE_PRICE_RANGE_FACTOR);
-    const extendedUpperBound = this.gridUpperBound + (gridRange * ORDER_SIZE_PRICE_RANGE_FACTOR);
-    const extendedRange = extendedUpperBound - extendedLowerBound;
+    // Calculate a simple percentage difference from reference price
+    const percentDiff = (price - this.referencePrice) / this.referencePrice;
     
-    // Normalized position (0 = lowest price, 1 = highest price)
-    const normalizedPosition = (price - extendedLowerBound) / extendedRange;
-    
-    // Clamp to range [0, 1]
-    const clampedPosition = Math.max(0, Math.min(1, normalizedPosition));
-    
-    // Calculate size multiplier (decreases as price increases)
+    // Different multiplier calculation for buy vs sell
     let sizeMultiplier: number;
     
     if (side === 'buy') {
-      // For buy orders: larger size at lower prices
+      // Lower prices get larger sizes (negative percentDiff = larger multiplier)
+      // Clamp the effect to a maximum of 30% price difference
+      const adjustedPercentDiff = Math.max(percentDiff, -0.3);
       sizeMultiplier = MAX_ORDER_SIZE_MULTIPLIER - 
-                       (clampedPosition * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER));
+                       (adjustedPercentDiff * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER) / 0.6);
     } else {
-      // For sell orders: smaller size at higher prices
+      // Higher prices get smaller sizes (positive percentDiff = smaller multiplier)
+      // Clamp the effect to a maximum of 30% price difference
+      const adjustedPercentDiff = Math.min(percentDiff, 0.3);
       sizeMultiplier = MIN_ORDER_SIZE_MULTIPLIER + 
-                       ((1 - clampedPosition) * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER));
+                       ((0.3 - adjustedPercentDiff) * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER) / 0.6);
     }
+    
+    // Hard safety - clamp multiplier between defined bounds
+    sizeMultiplier = Math.max(MIN_ORDER_SIZE_MULTIPLIER, Math.min(MAX_ORDER_SIZE_MULTIPLIER, sizeMultiplier));
     
     // Calculate final size
     const size = BASE_ORDER_SIZE * sizeMultiplier;
     
-    // Make sure we're not below the minimum lot size if we have instrument info
-    if (this.instrumentInfo) {
-      const minSizeInBTC = this.getLotSize();
-      return Math.max(size, minSizeInBTC);
-    }
-    
-    return size;
+    // Additional safety - absolute maximum order size cap regardless of calculation
+    const absoluteMaxSize = BASE_ORDER_SIZE * 2; 
+
+    return Math.min(size, absoluteMaxSize);
   }
 
   /**
@@ -1741,6 +1766,10 @@ export class LiveOrderManager {
       this.logger.info('Infinity grid feature is disabled, not starting auto grid shift check');
       return;
     }
+
+    // Log current grid status for diagnostics
+    this.logger.info(`Grid status - Reference price: $${this.referencePrice.toFixed(2)}, Lower bound: $${this.gridLowerBound.toFixed(2)}, Upper bound: $${this.gridUpperBound.toFixed(2)}`);
+    this.logger.info(`Active orders: ${this.activeOrders.length}, Buy orders: ${this.activeOrders.filter(o => o.side === 'buy').length}, Sell orders: ${this.activeOrders.filter(o => o.side === 'sell').length}`);
 
     if (this.autoShiftCheckIntervalId) {
       clearInterval(this.autoShiftCheckIntervalId);

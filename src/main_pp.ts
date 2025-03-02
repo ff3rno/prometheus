@@ -7,7 +7,15 @@ import { LiveWebSocket } from './live_websocket';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
 import { MetricsManager, MetricsConfig } from './metrics_manager';
-import { INFINITY_GRID_ENABLED, VARIABLE_ORDER_SIZE_ENABLED, ORDER_SIZE_PRICE_RANGE_FACTOR, MAX_ORDER_SIZE_MULTIPLIER, MIN_ORDER_SIZE_MULTIPLIER } from './constants';
+import { 
+  INFINITY_GRID_ENABLED, 
+  VARIABLE_ORDER_SIZE_ENABLED, 
+  ORDER_SIZE_PRICE_RANGE_FACTOR, 
+  MAX_ORDER_SIZE_MULTIPLIER, 
+  MIN_ORDER_SIZE_MULTIPLIER,
+  ORDER_DISTANCE,
+  ORDER_SIZE
+} from './constants';
 
 // Load environment variables
 dotenv.config();
@@ -32,6 +40,19 @@ const logger = new StatsLogger('pp-live');
 // Create data directory if it doesn't exist
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+// Validate configuration constants
+if (ORDER_DISTANCE <= 0) {
+  throw new Error(`Invalid ORDER_DISTANCE: ${ORDER_DISTANCE}, must be positive`);
+}
+
+if (ORDER_SIZE <= 0) {
+  throw new Error(`Invalid ORDER_SIZE: ${ORDER_SIZE}, must be positive`);
+}
+
+if (MAX_ORDER_SIZE_MULTIPLIER < MIN_ORDER_SIZE_MULTIPLIER) {
+  throw new Error(`Invalid order size multipliers: MAX_ORDER_SIZE_MULTIPLIER (${MAX_ORDER_SIZE_MULTIPLIER}) must be >= MIN_ORDER_SIZE_MULTIPLIER (${MIN_ORDER_SIZE_MULTIPLIER})`);
 }
 
 const run = async (): Promise<void> => {
