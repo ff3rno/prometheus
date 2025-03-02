@@ -322,6 +322,29 @@ export class BitMEXAPI {
   }
 
   /**
+   * Rounds a price to be a multiple of the tick size for a given instrument
+   */
+  private roundToTickSize(price: number, tickSize: number): number {
+    const precision = this.getPrecisionFromTickSize(tickSize);
+    const rounded = Math.round(price / tickSize) * tickSize;
+    return parseFloat(rounded.toFixed(precision));
+  }
+
+  /**
+   * Determines the decimal precision from a tick size
+   */
+  private getPrecisionFromTickSize(tickSize: number): number {
+    const tickSizeStr = tickSize.toString();
+    const decimalIndex = tickSizeStr.indexOf('.');
+    
+    if (decimalIndex === -1) {
+      return 0;
+    }
+    
+    return tickSizeStr.length - decimalIndex - 1;
+  }
+
+  /**
    * Places a limit order on BitMEX
    */
   async placeLimitOrder(side: 'Buy' | 'Sell', price: number, quantity: number, symbol: string = 'XBTUSD'): Promise<BitMEXOrder> {
@@ -360,6 +383,15 @@ export class BitMEXAPI {
       if (orderQty === 0) {
         orderQty = lotSize; // Use minimum lot size
         this.logger.warn(`Order quantity would be zero after adjustment - using minimum lot size ${lotSize} instead`);
+      }
+
+      // Ensure the price is a multiple of the tick size
+      const tickSize = instrument.tickSize;
+      const roundedPrice = this.roundToTickSize(price, tickSize);
+      
+      if (roundedPrice !== price) {
+        this.logger.warn(`Adjusted price from ${price} to ${roundedPrice} to comply with tick size ${tickSize}`);
+        price = roundedPrice;
       }
 
       const orderData = {

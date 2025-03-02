@@ -133,21 +133,53 @@ export class LiveOrderManager {
   }
   
   /**
-   * Calculate contract quantity respecting lot size
+   * Calculate contract quantity for an instrument
    */
   private calculateContractQty(btcSize: number, price: number): number {
-    const lotSize = this.getLotSize();
+    if (!this.instrumentInfo) {
+      return Math.round(btcSize * price);
+    }
     
-    // For XBTUSD instruments, 1 contract = 1 USD worth of BTC
-    if (this.symbol.includes('USD') && price > 0) {
-      // Calculate raw contract quantity
+    // For XBTUSD and similar "FFWCSX" instruments, convert BTC to USD contracts
+    if (this.symbol.includes('USD')) {
+      // Calculate raw contract quantity (1 contract = 1 USD)
       const rawContractQty = btcSize * price;
-      // Round to nearest lot size
+      
+      // Round to the instrument's lot size
+      const lotSize = this.instrumentInfo.lotSize;
       return Math.round(rawContractQty / lotSize) * lotSize;
     }
     
-    // For other instruments, use BTC size directly but ensure it's a multiple of lot size
-    return Math.round(btcSize / lotSize) * lotSize || lotSize; // Use at least 1 lot size
+    // For other instrument types, just return the BTC size
+    return btcSize;
+  }
+  
+  /**
+   * Round a price to the instrument's tick size
+   */
+  private roundPriceToTickSize(price: number): number {
+    if (!this.instrumentInfo) {
+      return price;
+    }
+    
+    const tickSize = this.instrumentInfo.tickSize;
+    const precision = this.getPrecisionFromTickSize(tickSize);
+    const rounded = Math.round(price / tickSize) * tickSize;
+    return parseFloat(rounded.toFixed(precision));
+  }
+  
+  /**
+   * Get decimal precision from tick size
+   */
+  private getPrecisionFromTickSize(tickSize: number): number {
+    const tickSizeStr = tickSize.toString();
+    const decimalIndex = tickSizeStr.indexOf('.');
+    
+    if (decimalIndex === -1) {
+      return 0;
+    }
+    
+    return tickSizeStr.length - decimalIndex - 1;
   }
   
   /**
@@ -365,6 +397,14 @@ export class LiveOrderManager {
    * Create an order and place it on the exchange
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
+    // Ensure price is rounded to the instrument's tick size
+    price = this.roundPriceToTickSize(price);
+    
+    // Round opposite order price if provided
+    if (oppositeOrderPrice !== null) {
+      oppositeOrderPrice = this.roundPriceToTickSize(oppositeOrderPrice);
+    }
+    
     const fee = price * size * (FEE_RATE / 100);
     
     // Calculate contract quantity for FFWCSX instruments, respecting lot size
@@ -423,24 +463,28 @@ export class LiveOrderManager {
    * Fill an order (either by simulation or by detecting real fill)
    */
   async fillOrder(order: Order, executionPrice: number): Promise<void> {
+    // Ensure execution price is rounded to the instrument's tick size
+    executionPrice = this.roundPriceToTickSize(executionPrice);
+    
     // Mark the order as filled
     order.filled = true;
     
-    // Log the fill with contract quantity if available
+    // Contract quantity string for logging
     const contractQtyStr = order.contractQty ? ` (${order.contractQty} contracts)` : '';
+    
     this.logger.success(`Order #${order.id} FILLED: ${order.side.toUpperCase()} ${order.size} BTC${contractQtyStr} @ $${executionPrice.toFixed(2)}`);
     
-    // Record order execution metrics
+    // If metrics are enabled, record the order execution
     if (this.metricsManager) {
       this.metricsManager.recordOrderExecution(
-        order.id, 
-        order.side, 
-        executionPrice, 
-        order.size, 
+        order.id,
+        order.side,
+        executionPrice,
+        order.size,
         order.fee
       );
       
-      // Record volume metrics
+      // Record trading volume
       this.metricsManager.recordVolume(
         order.size,
         executionPrice * order.size,
@@ -532,6 +576,17 @@ export class LiveOrderManager {
         this.stateManager.updateCompletedTrades(this.completedTrades);
         this.logger.recordTrade(netProfit, totalFees, order.size);
         
+        // If metrics are enabled, record the completed trade
+        if (this.metricsManager) {
+          this.metricsManager.recordTrade(
+            netProfit,
+            totalFees, 
+            order.size,
+            entryPrice,
+            exitPrice
+          );
+        }
+        
         // Update accumulated stats in state manager
         this.stateManager.updateStats(
           this.completedTrades.reduce((total, trade) => total + trade.profit, 0),
@@ -599,7 +654,8 @@ export class LiveOrderManager {
     // Clear any existing orders
     this.activeOrders = [];
     
-    this.referencePrice = midPrice;
+    // Ensure the reference price is rounded to tick size
+    this.referencePrice = this.roundPriceToTickSize(midPrice);
     
     // Get upward and downward grid spacing
     const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
@@ -607,14 +663,14 @@ export class LiveOrderManager {
     
     // Log grid initialization with asymmetric spacing if applicable
     if (upwardGridSpacing !== downwardGridSpacing) {
-      this.logger.star(`Initializing ASYMMETRIC grid at $${midPrice.toFixed(2)}, UP spacing: $${upwardGridSpacing.toFixed(2)}, DOWN spacing: $${downwardGridSpacing.toFixed(2)}`);
+      this.logger.star(`Initializing ASYMMETRIC grid at $${this.referencePrice.toFixed(2)}, UP spacing: $${upwardGridSpacing.toFixed(2)}, DOWN spacing: $${downwardGridSpacing.toFixed(2)}`);
       
       // Log trend information if available
       if (this.gridSizing.trendDirection) {
         this.logger.info(`Grid spacing asymmetry based on ${this.gridSizing.trendDirection} trend (strength: ${(this.gridSizing.trendStrength || 0).toFixed(2)})`);
       }
     } else {
-      this.logger.star(`Initializing SYMMETRIC grid at $${midPrice.toFixed(2)}, grid spacing: $${upwardGridSpacing.toFixed(2)}`);
+      this.logger.star(`Initializing SYMMETRIC grid at $${this.referencePrice.toFixed(2)}, grid spacing: $${upwardGridSpacing.toFixed(2)}`);
     }
     
     if (this.gridSizing.useATR && this.gridSizing.lastATRValue > 0) {
@@ -622,22 +678,26 @@ export class LiveOrderManager {
     }
     
     // Create buy orders below the mid price with asymmetric spacing
-    let currentBuyPrice = midPrice;
+    let currentBuyPrice = this.referencePrice;
     for (let i = 1; i <= ORDER_COUNT; i++) {
       currentBuyPrice -= downwardGridSpacing;
+      // Round the buy price to the instrument's tick size
+      const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
       // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-      await this.createOrder(currentBuyPrice, ORDER_SIZE, 'buy', null);
+      await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
     }
     
     // Create sell orders above the mid price with asymmetric spacing
-    let currentSellPrice = midPrice;
+    let currentSellPrice = this.referencePrice;
     for (let i = 1; i <= ORDER_COUNT; i++) {
       currentSellPrice += upwardGridSpacing;
+      // Round the sell price to the instrument's tick size
+      const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
       // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-      const order = await this.createOrder(currentSellPrice, ORDER_SIZE, 'sell', null);
+      const order = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
       // For sell orders, set the entry price to the current mid price
       // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
-      order.entryPrice = midPrice;
+      order.entryPrice = this.referencePrice;
     }
     
     // Calculate the total grid cost (capital required)
@@ -764,13 +824,10 @@ export class LiveOrderManager {
    * Handle real fill notification from BitMEX
    */
   async handleOrderFill(orderID: string, executionPrice: number, side: string, orderQty: number): Promise<void> {
-    // Check if we've already processed this order fill
-    if (this.processedOrderFills.has(orderID)) {
-      this.logger.info(`Order ${orderID} fill already processed, skipping duplicate notification`);
-      return;
-    }
-
-    // Find the local order that matches this BitMEX order ID
+    // Ensure execution price is rounded to the instrument's tick size
+    executionPrice = this.roundPriceToTickSize(executionPrice);
+    
+    // Find the matching order in our active orders
     const matchingOrder = this.activeOrders.find(order => order.bitmexOrderId === orderID);
     
     if (matchingOrder) {
@@ -875,191 +932,185 @@ export class LiveOrderManager {
    * Check for gaps in the grid and fill them with new orders
    */
   private async checkAndFillGridGaps(): Promise<void> {
-    if (!this.gridInitialized || this.activeOrders.length < 2) {
-      return; // Not enough orders to check for gaps
+    // Don't attempt to fill gaps if the grid isn't initialized
+    if (!this.gridInitialized || !this.instrumentInfo) {
+      return;
     }
     
-    try {
-      // Check if we have a valid current market price
-      if (this.currentMarketPrice <= 0) {
-        this.logger.warn('Cannot check for grid gaps: No valid market price available');
-        return;
-      }
+    // Round the current market price to the tick size
+    const currentPrice = this.roundPriceToTickSize(this.currentMarketPrice);
+    
+    // Get active orders separated by side
+    const buyOrders = this.activeOrders
+      .filter(order => order.side === 'buy' && !order.filled)
+      .sort((a, b) => b.price - a.price); // Sort by price descending for buy orders (highest first)
+    
+    const sellOrders = this.activeOrders
+      .filter(order => order.side === 'sell' && !order.filled)
+      .sort((a, b) => a.price - b.price); // Sort by price ascending for sell orders (lowest first)
+    
+    // Exit if we don't have both buy and sell orders
+    if (buyOrders.length === 0 || sellOrders.length === 0) {
+      this.logger.debug(`Cannot check for grid gaps: ${buyOrders.length} buy orders, ${sellOrders.length} sell orders`);
+      return;
+    }
+    
+    // Find the highest buy order and lowest sell order
+    const highestBuy = buyOrders[buyOrders.length - 1].price;
+    const lowestSell = sellOrders[0].price;
+    
+    // Get asymmetric grid distances
+    const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
+    const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+    
+    // Calculate mid grid distance for reference
+    const midGridDistance = (upwardGridSpacing + downwardGridSpacing) / 2;
+    
+    // Log current grid state for debugging
+    this.logger.debug(`Grid state: ${buyOrders.length} buy orders (highest: ${highestBuy.toFixed(2)}), ${sellOrders.length} sell orders (lowest: ${lowestSell.toFixed(2)})`);
+    
+    // Threshold for gap detection (1.5x normal distance to account for some flexibility)
+    const maxAllowedGap = midGridDistance * 1.5;
+    
+    // Check if there's a large gap between highest buy and lowest sell
+    if (lowestSell - highestBuy > maxAllowedGap) {
+      this.logger.warn(`Detected large gap between highest buy (${highestBuy.toFixed(2)}) and lowest sell (${lowestSell.toFixed(2)})`);
       
-      // Sort orders by price (ascending)
-      const sortedOrders = [...this.activeOrders]
-        .filter(order => !order.filled)
-        .sort((a, b) => a.price - b.price);
+      // Calculate the middle of the gap where we'll place new orders
+      const gapMiddle = (highestBuy + lowestSell) / 2;
       
-      // Separate buy and sell orders
-      const buyOrders = sortedOrders.filter(order => order.side === 'buy');
-      const sellOrders = sortedOrders.filter(order => order.side === 'sell');
+      // Calculate how many orders we can fit in the gap
+      const gapSize = lowestSell - highestBuy;
       
-      // Exit if we don't have both buy and sell orders
-      if (buyOrders.length === 0 || sellOrders.length === 0) {
-        this.logger.debug(`Cannot check for grid gaps: ${buyOrders.length} buy orders, ${sellOrders.length} sell orders`);
-        return;
-      }
+      // Determine the reference grid spacing for estimating order count
+      // For the middle gap, use average spacing as a reference
+      const avgGridSpacing = (upwardGridSpacing + downwardGridSpacing) / 2;
+      const possibleOrderCount = Math.floor(gapSize / avgGridSpacing) - 1;
       
-      // Find the highest buy order and lowest sell order
-      const highestBuy = buyOrders[buyOrders.length - 1].price;
-      const lowestSell = sellOrders[0].price;
-      
-      // Get asymmetric grid distances
-      const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
-      const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
-      
-      // Calculate mid grid distance for reference
-      const midGridDistance = (upwardGridSpacing + downwardGridSpacing) / 2;
-      
-      // Log current grid state for debugging
-      this.logger.debug(`Grid state: ${buyOrders.length} buy orders (highest: ${highestBuy.toFixed(2)}), ${sellOrders.length} sell orders (lowest: ${lowestSell.toFixed(2)})`);
-      
-      // Threshold for gap detection (1.5x normal distance to account for some flexibility)
-      const maxAllowedGap = midGridDistance * 1.5;
-      
-      // Check if there's a large gap between highest buy and lowest sell
-      if (lowestSell - highestBuy > maxAllowedGap) {
-        this.logger.warn(`Detected large gap between highest buy (${highestBuy.toFixed(2)}) and lowest sell (${lowestSell.toFixed(2)})`);
+      if (possibleOrderCount > 0) {
+        this.logger.info(`Filling gap with ${possibleOrderCount} orders`);
         
-        // Calculate the middle of the gap where we'll place new orders
-        const gapMiddle = (highestBuy + lowestSell) / 2;
-        
-        // Calculate how many orders we can fit in the gap
-        const gapSize = lowestSell - highestBuy;
-        
-        // Determine the reference grid spacing for estimating order count
-        // For the middle gap, use average spacing as a reference
-        const avgGridSpacing = (upwardGridSpacing + downwardGridSpacing) / 2;
-        const possibleOrderCount = Math.floor(gapSize / avgGridSpacing) - 1;
-        
-        if (possibleOrderCount > 0) {
-          this.logger.info(`Filling gap with ${possibleOrderCount} orders`);
+        // Place orders to fill the gap
+        for (let i = 1; i <= possibleOrderCount; i++) {
+          const ratio = i / (possibleOrderCount + 1);
+          const price = highestBuy + (gapSize * ratio);
           
-          // Place orders to fill the gap
-          for (let i = 1; i <= possibleOrderCount; i++) {
-            const ratio = i / (possibleOrderCount + 1);
-            const price = highestBuy + (gapSize * ratio);
+          // Determine order side based on position relative to the reference price
+          const side = price < this.referencePrice ? 'buy' : 'sell';
+          
+          // Skip this order if it would execute immediately against the market
+          if ((side === 'buy' && price >= currentPrice) || 
+              (side === 'sell' && price <= currentPrice)) {
+            this.logger.warn(`Skipping gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)} - would execute immediately at market price ${currentPrice.toFixed(2)}`);
+            continue;
+          }
+          
+          try {
+            const order = await this.createOrder(price, ORDER_SIZE, side, null);
+            if (side === 'sell') {
+              order.entryPrice = this.referencePrice;
+            }
+            this.logger.success(`Placed gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)}`);
             
-            // Determine order side based on position relative to the reference price
-            const side = price < this.referencePrice ? 'buy' : 'sell';
+            // Sleep briefly between order placements to avoid rate limits
+            if (i < possibleOrderCount) {
+              await new Promise(resolve => setTimeout(resolve, 200));
+            }
+          } catch (error) {
+            this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
+            // Continue with next order rather than stopping the entire process
+          }
+        }
+      }
+    }
+    
+    // Check for gaps between consecutive buy orders
+    for (let i = 0; i < buyOrders.length - 1; i++) {
+      const currentPrice = buyOrders[i].price;
+      const nextPrice = buyOrders[i + 1].price;
+      const gap = nextPrice - currentPrice;
+      
+      // Buy orders should use downward spacing
+      const maxAllowedBuyGap = downwardGridSpacing * 1.5;
+      
+      if (gap > maxAllowedBuyGap) {
+        this.logger.warn(`Detected gap between buy orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
+        
+        // Calculate number of orders to insert
+        const ordersToInsert = Math.floor(gap / downwardGridSpacing) - 1;
+        
+        if (ordersToInsert > 0) {
+          for (let j = 1; j <= ordersToInsert; j++) {
+            const price = currentPrice + (j * downwardGridSpacing);
             
             // Skip this order if it would execute immediately against the market
-            if ((side === 'buy' && price >= this.currentMarketPrice) || 
-                (side === 'sell' && price <= this.currentMarketPrice)) {
-              this.logger.warn(`Skipping gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
+            if (price >= currentPrice) {
+              this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - would execute immediately at market price ${currentPrice.toFixed(2)}`);
               continue;
             }
             
             try {
-              const order = await this.createOrder(price, ORDER_SIZE, side, null);
-              if (side === 'sell') {
-                order.entryPrice = this.referencePrice;
-              }
-              this.logger.success(`Placed gap-filling ${side.toUpperCase()} order at ${price.toFixed(2)}`);
+              await this.createOrder(price, ORDER_SIZE, 'buy', null);
+              this.logger.success(`Placed gap-filling BUY order at ${price.toFixed(2)}`);
               
-              // Sleep briefly between order placements to avoid rate limits
-              if (i < possibleOrderCount) {
+              // Sleep briefly between order placements
+              if (j < ordersToInsert) {
                 await new Promise(resolve => setTimeout(resolve, 200));
               }
             } catch (error) {
               this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-              // Continue with next order rather than stopping the entire process
+              // Continue with next order
             }
           }
         }
       }
-      
-      // Check for gaps between consecutive buy orders
-      for (let i = 0; i < buyOrders.length - 1; i++) {
-        const currentPrice = buyOrders[i].price;
-        const nextPrice = buyOrders[i + 1].price;
-        const gap = nextPrice - currentPrice;
-        
-        // Buy orders should use downward spacing
-        const maxAllowedBuyGap = downwardGridSpacing * 1.5;
-        
-        if (gap > maxAllowedBuyGap) {
-          this.logger.warn(`Detected gap between buy orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
-          
-          // Calculate number of orders to insert
-          const ordersToInsert = Math.floor(gap / downwardGridSpacing) - 1;
-          
-          if (ordersToInsert > 0) {
-            for (let j = 1; j <= ordersToInsert; j++) {
-              const price = currentPrice + (j * downwardGridSpacing);
-              
-              // Skip this order if it would execute immediately against the market
-              if (price >= this.currentMarketPrice) {
-                this.logger.warn(`Skipping gap-filling BUY order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
-                continue;
-              }
-              
-              try {
-                await this.createOrder(price, ORDER_SIZE, 'buy', null);
-                this.logger.success(`Placed gap-filling BUY order at ${price.toFixed(2)}`);
-                
-                // Sleep briefly between order placements
-                if (j < ordersToInsert) {
-                  await new Promise(resolve => setTimeout(resolve, 200));
-                }
-              } catch (error) {
-                this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-                // Continue with next order
-              }
-            }
-          }
-        }
-      }
-      
-      // Check for gaps between consecutive sell orders
-      for (let i = 0; i < sellOrders.length - 1; i++) {
-        const currentPrice = sellOrders[i].price;
-        const nextPrice = sellOrders[i + 1].price;
-        const gap = nextPrice - currentPrice;
-        
-        // Sell orders should use upward spacing
-        const maxAllowedSellGap = upwardGridSpacing * 1.5;
-        
-        if (gap > maxAllowedSellGap) {
-          this.logger.warn(`Detected gap between sell orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
-          
-          // Calculate number of orders to insert
-          const ordersToInsert = Math.floor(gap / upwardGridSpacing) - 1;
-          
-          if (ordersToInsert > 0) {
-            for (let j = 1; j <= ordersToInsert; j++) {
-              const price = currentPrice + (j * upwardGridSpacing);
-              
-              // Skip this order if it would execute immediately against the market
-              if (price <= this.currentMarketPrice) {
-                this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - would execute immediately at market price ${this.currentMarketPrice.toFixed(2)}`);
-                continue;
-              }
-              
-              try {
-                const order = await this.createOrder(price, ORDER_SIZE, 'sell', null);
-                order.entryPrice = this.referencePrice;
-                this.logger.success(`Placed gap-filling SELL order at ${price.toFixed(2)}`);
-                
-                // Sleep briefly between order placements
-                if (j < ordersToInsert) {
-                  await new Promise(resolve => setTimeout(resolve, 200));
-                }
-              } catch (error) {
-                this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
-                // Continue with next order
-              }
-            }
-          }
-        }
-      }
-      
-      // Update state after filling gaps
-      this.stateManager.updateActiveOrders(this.activeOrders);
-    } catch (error) {
-      this.logger.error(`Error checking for grid gaps: ${error}`);
     }
+    
+    // Check for gaps between consecutive sell orders
+    for (let i = 0; i < sellOrders.length - 1; i++) {
+      const currentPrice = sellOrders[i].price;
+      const nextPrice = sellOrders[i + 1].price;
+      const gap = nextPrice - currentPrice;
+      
+      // Sell orders should use upward spacing
+      const maxAllowedSellGap = upwardGridSpacing * 1.5;
+      
+      if (gap > maxAllowedSellGap) {
+        this.logger.warn(`Detected gap between sell orders: ${currentPrice.toFixed(2)} and ${nextPrice.toFixed(2)}`);
+        
+        // Calculate number of orders to insert
+        const ordersToInsert = Math.floor(gap / upwardGridSpacing) - 1;
+        
+        if (ordersToInsert > 0) {
+          for (let j = 1; j <= ordersToInsert; j++) {
+            const price = currentPrice + (j * upwardGridSpacing);
+            
+            // Skip this order if it would execute immediately against the market
+            if (price <= currentPrice) {
+              this.logger.warn(`Skipping gap-filling SELL order at ${price.toFixed(2)} - would execute immediately at market price ${currentPrice.toFixed(2)}`);
+              continue;
+            }
+            
+            try {
+              const order = await this.createOrder(price, ORDER_SIZE, 'sell', null);
+              order.entryPrice = this.referencePrice;
+              this.logger.success(`Placed gap-filling SELL order at ${price.toFixed(2)}`);
+              
+              // Sleep briefly between order placements
+              if (j < ordersToInsert) {
+                await new Promise(resolve => setTimeout(resolve, 200));
+              }
+            } catch (error) {
+              this.logger.error(`Failed to place gap-filling order at ${price.toFixed(2)}: ${error}`);
+              // Continue with next order
+            }
+          }
+        }
+      }
+    }
+    
+    // Update state after filling gaps
+    this.stateManager.updateActiveOrders(this.activeOrders);
   }
   
   /**
