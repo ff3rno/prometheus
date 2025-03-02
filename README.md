@@ -1,30 +1,45 @@
 # Prometheus
 
-A sophisticated BitMEX Grid Trading Bot designed for efficient cryptocurrency trading on the BitMEX exchange.
+A sophisticated BitMEX Grid Trading Bot designed for professional cryptocurrency trading with adaptive grid strategies.
 
 ## Overview
 
-Prometheus is an automated trading bot implementing a grid trading strategy on BitMEX. Grid trading involves placing buy and sell orders at regular price intervals, creating a grid of orders that can profit from price volatility within a range.
+Prometheus implements an advanced grid trading system for BitMEX that automatically places buy and sell orders at calculated price intervals. The system creates a dynamic grid of orders that can capture profits from price volatility within a specified range, with intelligent adaptations based on market conditions.
 
-## Features
+## Key Features
 
-- **Advanced Grid Trading Strategy** - Places orders at configurable intervals to capitalize on price movements
-- **Dynamic Grid Sizing** - Adjusts grid spacing based on Average True Range (ATR) for volatility-responsive trading
-- **Trend Detection** - Uses RSI, Fast/Slow EMA indicators to identify market trends and adjust strategy
-- **Asymmetric Grid Positioning** - Automatically places wider grid spacing in the trend direction for optimized profit potential
-- **Live Trading & Dry Run Modes** - Test with no risk using the dry run mode
-- **Real-Time Data Processing** - WebSocket integration for live market data
-- **State Persistence** - Trading session state is saved and can be resumed
-- **Comprehensive Metrics Integration** - InfluxDB integration for detailed performance tracking including profit/loss, volume, fees, ATR values, and trend metrics
-- **Smart API Management** - Rate limiting and exponential backoff for API interaction
-- **Auto-Reconnection** - Robust WebSocket reconnection with exponential backoff
-- **Detailed Logging** - Comprehensive activity logs with trading statistics
+- **Adaptive Grid Trading**
+  - Dynamic grid spacing based on Average True Range (ATR)
+  - Asymmetric grid positioning aligned with detected market trends
+  - Automatically fills detected grid gaps during operation
+
+- **Intelligent Order Management**
+  - Precise order matching for round-trip trade tracking
+  - Automatic gap detection and repair in order grid
+  - Smart order sizing that varies with price levels
+
+- **Market Trend Detection**
+  - Real-time trend analysis using multiple technical indicators
+  - Adjusts grid asymmetry based on trend direction and strength
+  - Optimizes profit potential by widening grid in trend direction
+
+- **Advanced Risk Management**
+  - Position size limits to control exposure
+  - Order count limits to manage API usage and risk
+  - Configurable parameters for fine-tuning risk profile
+
+- **Operational Features**
+  - Live trading and simulation (dry run) modes
+  - WebSocket integration for real-time market data
+  - Persistent state management across sessions
+  - Comprehensive metrics collection via InfluxDB (optional)
+  - Robust error handling and automatic recovery
 
 ## Installation
 
 ### Prerequisites
 
-- Node.js (v14 or later)
+- Node.js (v16 or later)
 - npm or yarn
 - BitMEX account with API credentials (for live trading)
 - InfluxDB (optional, for metrics collection)
@@ -47,11 +62,16 @@ npm install
 npm run build
 ```
 
-4. Create a `.env` file in the project root with your configuration (see Configuration section).
+4. Configure your environment:
+```bash
+cp .env.example .env
+```
+
+5. Edit the `.env` file with your BitMEX API credentials and preferences
 
 ## Configuration
 
-Create a `.env` file with the following variables:
+The `.env` file controls the main application settings:
 
 ```
 # BitMEX API Credentials
@@ -62,7 +82,7 @@ BITMEX_API_SECRET=your_api_secret
 TRADING_SYMBOL=XBTUSD
 DRY_RUN=true  # Set to false for live trading
 
-# Data Directory
+# Data Directory (for state persistence)
 DATA_DIR=./data
 
 # InfluxDB Configuration (Optional)
@@ -70,21 +90,58 @@ INFLUX_ENABLED=false
 INFLUX_HOST=http://localhost:8086
 INFLUX_TOKEN=your_influx_token
 INFLUX_DATABASE=prometheus_grid
+INFLUX_DEBUG=false
 ```
+
+## Advanced Configuration
+
+Fine-tune trading behavior by modifying constants in `src/constants.ts`:
+
+### Grid Parameters
+- `ORDER_COUNT`: Number of orders on each side of the grid
+- `ORDER_DISTANCE`: Base distance between orders in USD
+- `ORDER_SIZE`: Base size of each order in BTC
+- `ENFORCE_ORDER_DISTANCE`: Whether to strictly enforce minimum distance between orders
+
+### Risk Management
+- `MAX_POSITION_SIZE_BTC`: Maximum allowed position size in BTC
+- `MAX_OPEN_ORDERS`: Maximum number of open orders allowed
+- `FEE_RATE`: Trading fee rate in percentage
+
+### Dynamic Grid Features
+- `INFINITY_GRID_ENABLED`: Enable grid that automatically shifts with market movement
+- `GRID_SHIFT_THRESHOLD`: When to shift grid based on price movement
+- `GRID_SHIFT_OVERLAP`: Percentage of orders to keep when shifting
+- `GRID_AUTO_SHIFT_CHECK_INTERVAL`: How often to check for grid shifts
+
+### Variable Order Sizing
+- `VARIABLE_ORDER_SIZE_ENABLED`: Enable dynamic order sizing based on price levels
+- `BASE_ORDER_SIZE`: Reference order size for calculations
+- `MAX_ORDER_SIZE_MULTIPLIER`: Maximum multiplier for order size at low prices
+- `MIN_ORDER_SIZE_MULTIPLIER`: Minimum multiplier for order size at high prices
+
+### Technical Indicators
+- `ATR_PERIOD`: Period for ATR calculation
+- `ATR_MULTIPLIER`: Multiplier for ATR to determine grid spacing
+- `ATR_MINIMUM_GRID_DISTANCE`: Minimum allowed grid distance
+- `ATR_MAXIMUM_GRID_DISTANCE`: Maximum allowed grid distance
+- `TREND_RSI_PERIOD`: RSI period for trend detection
+- `TREND_FAST_EMA_PERIOD`: Fast EMA period for trend detection
+- `TREND_SLOW_EMA_PERIOD`: Slow EMA period for trend detection
 
 ## Usage
 
-### Dry Run Mode
+### Dry Run Mode (Simulation)
 
-Run the bot in dry run mode (no real orders will be placed):
+Test without placing real orders:
 
 ```bash
 npm run dry-run
 ```
 
-### Live Trading Mode
+### Live Trading
 
-⚠️ **WARNING**: This will place real orders using your BitMEX account. 
+⚠️ **WARNING**: This will place real orders using your BitMEX account funds. 
 
 ```bash
 npm start
@@ -98,65 +155,31 @@ For development with live reloading:
 npm run dev
 ```
 
-### Print Orders
+## System Architecture
 
-To view the current order grid:
+Prometheus consists of several specialized components:
 
-```bash
-npm run print-orders
-```
+- **LiveOrderManager**: Core system that manages the grid of orders, processes trades, and handles fills
+- **LiveWebSocket**: Connects to BitMEX WebSocket API for real-time market data and execution updates
+- **BitMEXAPI**: Handles REST API interactions with BitMEX with smart rate limiting
+- **TrendAnalyzer**: Performs technical analysis to detect market trends for grid optimization
+- **StateManager**: Provides persistence of trading state and statistics
+- **MetricsManager**: Tracks comprehensive trading metrics to InfluxDB
+- **StatsLogger**: Handles structured logging with trading statistics
 
-## Configuration Options
+## Performance Metrics
 
-The trading behavior can be customized by modifying the constants in `src/constants.ts`:
+When InfluxDB integration is enabled, Prometheus tracks detailed metrics:
 
-### Basic Configuration
-- `ORDER_COUNT`: Number of orders on each side of the grid
-- `ORDER_DISTANCE`: Base distance between grid orders
-- `ORDER_SIZE`: Size of each order in BTC
-
-### Advanced Configuration
-- `ATR_PERIOD`: Period for ATR calculation (default: 14)
-- `ATR_MULTIPLIER`: Multiplier for ATR to determine grid spacing (default: 1.5)
-- `ATR_MINIMUM_GRID_DISTANCE`: Minimum grid distance in USD (default: 50)
-- `ATR_MAXIMUM_GRID_DISTANCE`: Maximum grid distance in USD (default: 250)
-- `TREND_RSI_PERIOD`: RSI period for trend detection (default: 14)
-- `TREND_FAST_EMA_PERIOD`: Fast EMA period for trend detection (default: 8)
-- `TREND_SLOW_EMA_PERIOD`: Slow EMA period for trend detection (default: 21)
-- `TREND_MAX_ASYMMETRY`: Maximum grid spacing multiplier in trend direction (default: 1.5)
-
-## Key Components
-
-- **LiveOrderManager**: Manages the order grid, processes trades, and handles order fills
-- **TrendAnalyzer**: Detects market trends using technical indicators to optimize grid placement
-- **LiveWebSocket**: Connects to BitMEX WebSocket API to receive real-time market data
-- **BitMEXAPI**: Handles all REST API interactions with BitMEX
-- **StateManager**: Provides state persistence across bot restarts
-- **MetricsManager**: Records comprehensive trading metrics to InfluxDB (when enabled)
-
-## Data Storage
-
-The bot stores state in a JSON file located in the data directory. This includes:
-- Active orders
-- Completed trades
-- Cumulative P&L
-- Trading statistics
-- Grid configuration
-
-## Metrics Collection
-
-When InfluxDB integration is enabled, the bot tracks:
-- Trade profit/loss
-- Order executions
-- Trading volume
-- Grid statistics
-- ATR values
-- Trend metrics and grid distances
-- Grid asymmetry factors
+- **Trading Performance**: P&L, fees, win/loss ratio
+- **Execution Data**: Order fills, execution prices, slippage
+- **Market Analysis**: ATR values, trend direction and strength
+- **Grid Statistics**: Order spacing, asymmetry factors, grid shifts
+- **System Health**: Heartbeats, reconnections, API rate limit usage
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please follow these steps:
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
@@ -170,6 +193,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Disclaimer
 
-Trading cryptocurrencies involves significant risk and can result in the loss of your invested capital. This software is provided for educational purposes only and you should not risk money that you cannot afford to lose. The creators of this software are not responsible for any financial losses incurred while using this software.
+Trading cryptocurrencies involves significant risk and can result in the loss of your invested capital. This software is provided for educational purposes only. You should not risk money that you cannot afford to lose. The creators of this software are not responsible for any financial losses incurred while using this software.
 
-Always start with small amounts and test thoroughly before committing significant capital.
+BitMEX is a complex trading platform with significant leverage capabilities. Always start with small amounts and thoroughly test before committing significant capital.
