@@ -3,6 +3,8 @@ import { StatsLogger } from './logger';
 
 export interface MetricsConfig {
   host: string;
+  organization?: string;
+  port?: number;
   token: string;
   database: string;
   enabled: boolean;

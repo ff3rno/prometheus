@@ -516,9 +516,8 @@ export class LiveOrderManager {
     // Use asymmetric grid spacing based on the order side
     // For buy fills, we place a sell, so use upward spacing
     // For sell fills, we place a buy, so use downward spacing
-    const gridSpacing = order.side === 'buy' 
-      ? (this.gridSizing.upwardGridSpacing || this.getGridDistance())  // For buy fills, place sell with upward spacing
-      : (this.gridSizing.downwardGridSpacing || this.getGridDistance()); // For sell fills, place buy with downward spacing
+    const newSide = order.side === 'buy' ? 'sell' : 'buy';
+    const gridSpacing = this.getAsymmetricGridDistance(newSide, executionPrice);
     
     // Calculate a new appropriate price based on the execution price and asymmetric spacing
     const newPrice = order.side === 'buy' 
@@ -537,7 +536,6 @@ export class LiveOrderManager {
     }
     
     // Create a new order in the opposite direction
-    const newSide = order.side === 'buy' ? 'sell' : 'buy';
     const newOrder = await this.createOrder(newPrice, order.size, newSide, null);
     
     // For sell orders created after buy fills, set the entry price to track profit
@@ -1032,14 +1030,15 @@ export class LiveOrderManager {
     const lowestSell = sellOrders[0].price;
     
     // Get asymmetric grid distances
-    const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
-    const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+    const upwardGridSpacing = this.getAsymmetricGridDistance('sell', currentPrice);
+    const downwardGridSpacing = this.getAsymmetricGridDistance('buy', currentPrice);
     
     // Calculate mid grid distance for reference
     const midGridDistance = (upwardGridSpacing + downwardGridSpacing) / 2;
     
     // Log current grid state for debugging
     this.logger.debug(`Grid state: ${buyOrders.length} buy orders (highest: ${highestBuy.toFixed(2)}), ${sellOrders.length} sell orders (lowest: ${lowestSell.toFixed(2)})`);
+    this.logger.debug(`Using asymmetric grid: upward=${upwardGridSpacing.toFixed(2)}, downward=${downwardGridSpacing.toFixed(2)}, mid=${midGridDistance.toFixed(2)}`);
     
     // Threshold for gap detection (using the new configurable tolerance value)
     const maxAllowedGap = midGridDistance * GAP_DETECTION_TOLERANCE;
@@ -1465,11 +1464,22 @@ export class LiveOrderManager {
       if (this.metricsManager) {
         this.metricsManager.recordATR(atrValue);
         this.metricsManager.recordGridDistance(baseGridDistance);
+        
+        const upSpacing = this.gridSizing.upwardGridSpacing || baseGridDistance;
+        const downSpacing = this.gridSizing.downwardGridSpacing || baseGridDistance;
+        
+        // Check if spacing is asymmetric as expected
+        if (this.gridSizing.trendDirection !== 'neutral' && Math.abs(upSpacing - downSpacing) < 0.01) {
+          this.logger.warn(`Recording metrics with symmetric grid spacing despite ${this.gridSizing.trendDirection} trend! up=${upSpacing}, down=${downSpacing}`);
+        } else {
+          this.logger.debug(`Recording metrics with proper ${this.gridSizing.trendDirection || 'neutral'} trend spacing: up=${upSpacing}, down=${downSpacing}`);
+        }
+        
         this.metricsManager.recordTrendMetrics(
           this.gridSizing.trendDirection || 'neutral', 
           this.gridSizing.trendStrength || 0, 
-          this.gridSizing.upwardGridSpacing || baseGridDistance, 
-          this.gridSizing.downwardGridSpacing || baseGridDistance
+          upSpacing, 
+          downSpacing
         );
       }
       
@@ -1488,21 +1498,31 @@ export class LiveOrderManager {
     let upwardGridSpacing: number;
     let downwardGridSpacing: number;
     
+    // Ensure asymmetry factor is properly applied
+    if (Math.abs(asymmetryFactor - 1.0) < 0.01) {
+      this.logger.warn(`Asymmetry factor is very close to 1.0 (${asymmetryFactor.toFixed(4)}), which indicates improper trend analysis or calculation`);
+    }
+    
     if (trendAnalysis.direction === 'bullish') {
       // In bullish trend, wider spacing above (in direction of trend), tighter below
       upwardGridSpacing = Math.round(baseGridDistance * asymmetryFactor);
       downwardGridSpacing = Math.round(baseGridDistance / asymmetryFactor);
-      this.logger.info(`Bullish trend: Wider grid spacing above (${upwardGridSpacing}), tighter below (${downwardGridSpacing})`);
+      this.logger.info(`Bullish trend: Wider grid spacing above (${upwardGridSpacing}), tighter below (${downwardGridSpacing}), asymmetry=${asymmetryFactor.toFixed(4)}, strength=${trendAnalysis.strength.toFixed(4)}`);
     } else if (trendAnalysis.direction === 'bearish') {
       // In bearish trend, wider spacing below (in direction of trend), tighter above
       upwardGridSpacing = Math.round(baseGridDistance / asymmetryFactor);
       downwardGridSpacing = Math.round(baseGridDistance * asymmetryFactor);
-      this.logger.info(`Bearish trend: Tighter grid spacing above (${upwardGridSpacing}), wider below (${downwardGridSpacing})`);
+      this.logger.info(`Bearish trend: Tighter grid spacing above (${upwardGridSpacing}), wider below (${downwardGridSpacing}), asymmetry=${asymmetryFactor.toFixed(4)}, strength=${trendAnalysis.strength.toFixed(4)}`);
     } else {
       // Neutral trend, symmetric grid
       upwardGridSpacing = baseGridDistance;
       downwardGridSpacing = baseGridDistance;
-      this.logger.info(`Neutral trend: Symmetric grid spacing (${baseGridDistance})`);
+      this.logger.info(`Neutral trend: Symmetric grid spacing (${baseGridDistance}), asymmetry=1.0`);
+    }
+    
+    // Verify the asymmetry worked as expected
+    if (trendAnalysis.direction !== 'neutral' && upwardGridSpacing === downwardGridSpacing) {
+      this.logger.error(`Grid asymmetry failed! Direction=${trendAnalysis.direction}, asymmetry factor=${asymmetryFactor}, but spacing is symmetric: up=${upwardGridSpacing}, down=${downwardGridSpacing}`);
     }
     
     // Update grid sizing config
@@ -1511,6 +1531,9 @@ export class LiveOrderManager {
     this.gridSizing.asymmetryFactor = trendAnalysis.asymmetryFactor;
     this.gridSizing.upwardGridSpacing = upwardGridSpacing;
     this.gridSizing.downwardGridSpacing = downwardGridSpacing;
+    
+    // Save to state manager to persist grid sizing changes
+    this.stateManager.updateGridSizing(this.gridSizing);
   }
   
   /**
@@ -1560,10 +1583,16 @@ export class LiveOrderManager {
     
     // For buy orders (below current price), use downward spacing
     // For sell orders (above current price), use upward spacing
+    const upwardSpacing = this.gridSizing.upwardGridSpacing || this.gridSizing.currentDistance;
+    const downwardSpacing = this.gridSizing.downwardGridSpacing || this.gridSizing.currentDistance;
+    
+    // Log the actual spacings for debugging
+    this.logger.debug(`Using asymmetric grid: upward=${upwardSpacing.toFixed(2)}, downward=${downwardSpacing.toFixed(2)}, trend=${this.gridSizing.trendDirection || 'unknown'}, asymmetry=${this.gridSizing.asymmetryFactor || 1.0}`);
+    
     if (side === 'buy') {
-      return this.gridSizing.downwardGridSpacing || this.gridSizing.currentDistance;
+      return downwardSpacing;
     } else {
-      return this.gridSizing.upwardGridSpacing || this.gridSizing.currentDistance;
+      return upwardSpacing;
     }
   }
 

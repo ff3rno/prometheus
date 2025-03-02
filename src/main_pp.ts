@@ -68,6 +68,11 @@ const run = async (): Promise<void> => {
     if (INFLUX_ENABLED) {
       logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})${INFLUX_DEBUG ? ' [DEBUG MODE]' : ''}`);
       metricsManager = new MetricsManager(logger, metricsConfig, SYMBOL);
+      
+      // Enable additional debug logging if in debug mode
+      if (INFLUX_DEBUG) {
+        logger.info('Metrics debug mode enabled, additional verbose logging will be shown');
+      }
     } else {
       logger.warn('InfluxDB metrics disabled');
     }
