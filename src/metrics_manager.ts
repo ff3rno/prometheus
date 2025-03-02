@@ -154,6 +154,76 @@ export class MetricsManager {
   }
 
   /**
+   * Record ATR value
+   */
+  public recordATR(atrValue: number): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('volatility')
+        .setTag('instrument', this.tradingPair)
+        .setTag('indicator', 'atr')
+        .setField('value', atrValue);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `ATR value ${atrValue.toFixed(2)}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for ATR: ${error}`);
+    }
+  }
+
+  /**
+   * Record grid distance
+   */
+  public recordGridDistance(distance: number): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('grid_config')
+        .setTag('instrument', this.tradingPair)
+        .setField('base_distance', distance);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Grid distance ${distance}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for grid distance: ${error}`);
+    }
+  }
+
+  /**
+   * Record trend metrics
+   */
+  public recordTrendMetrics(
+    direction: string, 
+    strength: number, 
+    upwardSpacing: number, 
+    downwardSpacing: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('trend')
+        .setTag('instrument', this.tradingPair)
+        .setTag('direction', direction)
+        .setField('strength', strength)
+        .setField('upward_spacing', upwardSpacing)
+        .setField('downward_spacing', downwardSpacing)
+        .setField('asymmetry', upwardSpacing / downwardSpacing);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Trend ${direction} (strength: ${strength.toFixed(2)})`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for trend: ${error}`);
+    }
+  }
+
+  /**
    * Close the InfluxDB client connection
    */
   public close(): void {

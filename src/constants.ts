@@ -9,13 +9,22 @@ export const ORDER_SIZE = 0.005 // Size of each order in BTC (for FFWCSX instrum
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation
 export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing
-export const ATR_MINIMUM_GRID_DISTANCE = 60 // Minimum grid distance in USD
+export const ATR_MINIMUM_GRID_DISTANCE = 50 // Minimum grid distance in USD
 export const ATR_MAXIMUM_GRID_DISTANCE = 250 // Maximum grid distance in USD
-export const ATR_RECALCULATION_INTERVAL = 1000 * 60 * 15 // Recalculate ATR hourly (in milliseconds)
-export const ATR_HISTORICAL_TRADES_LOOKBACK = 120 // How many minutes back to fetch trades for ATR calculation
+export const ATR_RECALCULATION_INTERVAL =  1000 * 60 * 15 // Recalculate ATR
+export const ATR_HISTORICAL_TRADES_LOOKBACK = 60 // How many minutes to look back for historical trades
+
+// Trend analyzer parameters
+export const TREND_RSI_PERIOD = 14 // RSI period for trend detection
+export const TREND_FAST_EMA_PERIOD = 8 // Fast EMA period for trend detection
+export const TREND_SLOW_EMA_PERIOD = 21 // Slow EMA period for trend detection
+export const TREND_RSI_OVERBOUGHT = 70 // RSI overbought threshold 
+export const TREND_RSI_OVERSOLD = 30 // RSI oversold threshold
+export const TREND_MAX_ASYMMETRY = 1.5 // Maximum grid spacing multiplier in trend direction
+export const TREND_MIN_ASYMMETRY = 0.75 // Minimum grid spacing multiplier against trend
 
 // Sync interval for checking order statuses (in milliseconds)
-export const ORDER_SYNC_INTERVAL = 10000 // 10 seconds
+export const ORDER_SYNC_INTERVAL = 60000 // 60 seconds
 
 // Trading fee rate (in percentage)
 export const FEE_RATE = 0.0500 // 0.0500% of trade value

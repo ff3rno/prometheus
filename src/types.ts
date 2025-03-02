@@ -284,4 +284,10 @@ export interface GridSizingConfig {
   currentDistance: number
   lastATRValue: number
   lastRecalculation: number
+  // Trend-based parameters for asymmetric grid spacing
+  trendDirection?: 'bullish' | 'bearish' | 'neutral'
+  trendStrength?: number
+  asymmetryFactor?: number
+  upwardGridSpacing?: number // Spacing for orders above current price
+  downwardGridSpacing?: number // Spacing for orders below current price
 } 
