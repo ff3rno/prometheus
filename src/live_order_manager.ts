@@ -5,6 +5,9 @@ import { StateManager } from './state_manager';
 import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
 import { MetricsManager } from './metrics_manager';
 import { ORDER_DISTANCE, ORDER_COUNT, ORDER_SIZE, MAX_POSITION_SIZE_BTC, MAX_OPEN_ORDERS, ENFORCE_ORDER_DISTANCE, ATR_PERIOD, ATR_MULTIPLIER, ATR_MINIMUM_GRID_DISTANCE, ATR_MAXIMUM_GRID_DISTANCE, ATR_RECALCULATION_INTERVAL, ATR_HISTORICAL_TRADES_LOOKBACK, ORDER_SYNC_INTERVAL, GAP_DETECTION_TOLERANCE, getNextOrderId, FEE_RATE } from './constants';
+import { VARIABLE_ORDER_SIZE_ENABLED, BASE_ORDER_SIZE, MAX_ORDER_SIZE_MULTIPLIER, 
+  MIN_ORDER_SIZE_MULTIPLIER, ORDER_SIZE_PRICE_RANGE_FACTOR, INFINITY_GRID_ENABLED,
+  GRID_SHIFT_THRESHOLD, GRID_SHIFT_OVERLAP, GRID_AUTO_SHIFT_CHECK_INTERVAL } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
 export class LiveOrderManager {
@@ -40,6 +43,13 @@ export class LiveOrderManager {
   private _isInitializingGrid: boolean = false;
   private lastGridInitTimestamp: number = 0;
   private readonly GRID_INIT_THROTTLE_MS: number = 5000; // Minimum time between grid initializations
+  
+  // New properties for infinity grid and variable order size
+  private gridLowerBound: number = 0;
+  private gridUpperBound: number = 0; 
+  private autoShiftCheckIntervalId: NodeJS.Timeout | null = null;
+  private lastGridShiftTimestamp: number = 0;
+  private readonly GRID_SHIFT_THROTTLE_MS: number = 10000; // Minimum time between grid shifts
 
   constructor(
     api: BitMEXAPI,
@@ -117,6 +127,11 @@ export class LiveOrderManager {
       
       // Initialize ATR recalculation
       this.startATRRecalculationInterval();
+      
+      // Start the auto grid shift check if infinity grid is enabled
+      if (INFINITY_GRID_ENABLED) {
+        this.startAutoGridShiftCheck();
+      }
       
       this.logger.success('Order manager initialized');
     } catch (error) {
@@ -401,6 +416,14 @@ export class LiveOrderManager {
     // Round price to tick size
     const roundedPrice = this.roundPriceToTickSize(price);
     
+    // Apply variable order size calculation if enabled
+    const orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : size;
+    
+    // Log if we're using a variable order size
+    if (VARIABLE_ORDER_SIZE_ENABLED && Math.abs(orderSize - size) > 0.00001) {
+      this.logger.info(`Using variable order size: ${side} @ ${roundedPrice} - adjusted from ${size.toFixed(8)} to ${orderSize.toFixed(8)} BTC`);
+    }
+    
     // Check if we already have an order at this price point
     const existingOrder = this.activeOrders.find(
       order => !order.filled && 
@@ -420,7 +443,7 @@ export class LiveOrderManager {
     }
     
     // Check if we would exceed the maximum position size
-    const exceedsPositionLimit = await this.wouldExceedPositionLimit(size, side);
+    const exceedsPositionLimit = await this.wouldExceedPositionLimit(orderSize, side);
     if (exceedsPositionLimit) {
       this.logger.warn(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded. Cannot create new ${side} order at ${roundedPrice}`);
       throw new Error(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded`);
@@ -428,16 +451,16 @@ export class LiveOrderManager {
     
     // Calculate fees - BitMEX charges fees on the value (price * quantity)
     const feeRate = FEE_RATE / 100; // Convert from percentage to decimal
-    const fee = roundedPrice * size * feeRate;
+    const fee = roundedPrice * orderSize * feeRate;
     
     // Calculate contract quantity for BitMEX
-    const contractQty = this.calculateContractQty(size, roundedPrice);
+    const contractQty = this.calculateContractQty(orderSize, roundedPrice);
     
     // Create new order object
     const order: Order = {
       id: getNextOrderId(),
       price: roundedPrice,
-      size,
+      size: orderSize,
       contractQty,
       side,
       fee,
@@ -716,6 +739,10 @@ export class LiveOrderManager {
       // Get upward and downward grid spacing
       const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
       const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+      
+      // Calculate grid boundaries
+      this.gridLowerBound = this.referencePrice - (downwardGridSpacing * ORDER_COUNT);
+      this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
       
       // Log grid initialization with asymmetric spacing if applicable
       if (upwardGridSpacing !== downwardGridSpacing) {
@@ -1226,8 +1253,17 @@ export class LiveOrderManager {
    * Clean up resources when shutting down
    */
   public cleanup(): void {
-    this.stopPeriodicSync();
+    // Stop the sync interval
+    if (this.syncIntervalId) {
+      clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+    }
+    
+    // Stop the ATR recalculation interval
     this.stopATRRecalculationInterval();
+    
+    // Stop the auto grid shift check
+    this.stopAutoGridShiftCheck();
     
     // Save final state
     if (this.stateManager) {
@@ -1238,7 +1274,7 @@ export class LiveOrderManager {
       this.stateManager.saveState();
     }
     
-    this.logger.info('Order manager resources cleaned up');
+    this.logger.info('LiveOrderManager cleanup complete - all intervals stopped');
   }
 
   /**
@@ -1644,5 +1680,277 @@ export class LiveOrderManager {
    */
   private wouldExceedOrderLimit(): boolean {
     return this.activeOrders.length >= MAX_OPEN_ORDERS;
+  }
+
+  /**
+   * Calculate variable order size based on price level
+   * This implements larger buys at lower prices and smaller buys at higher prices
+   */
+  private calculateVariableOrderSize(price: number, side: 'buy' | 'sell'): number {
+    if (!VARIABLE_ORDER_SIZE_ENABLED) {
+      return BASE_ORDER_SIZE;
+    }
+
+    // We need reference price and grid boundaries to calculate variable sizes
+    if (this.referencePrice <= 0 || this.gridLowerBound <= 0 || this.gridUpperBound <= 0) {
+      return BASE_ORDER_SIZE;
+    }
+
+    // Calculate relative position of price within the grid
+    const gridRange = this.gridUpperBound - this.gridLowerBound;
+    const extendedLowerBound = this.gridLowerBound - (gridRange * ORDER_SIZE_PRICE_RANGE_FACTOR);
+    const extendedUpperBound = this.gridUpperBound + (gridRange * ORDER_SIZE_PRICE_RANGE_FACTOR);
+    const extendedRange = extendedUpperBound - extendedLowerBound;
+    
+    // Normalized position (0 = lowest price, 1 = highest price)
+    const normalizedPosition = (price - extendedLowerBound) / extendedRange;
+    
+    // Clamp to range [0, 1]
+    const clampedPosition = Math.max(0, Math.min(1, normalizedPosition));
+    
+    // Calculate size multiplier (decreases as price increases)
+    let sizeMultiplier: number;
+    
+    if (side === 'buy') {
+      // For buy orders: larger size at lower prices
+      sizeMultiplier = MAX_ORDER_SIZE_MULTIPLIER - 
+                       (clampedPosition * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER));
+    } else {
+      // For sell orders: smaller size at higher prices
+      sizeMultiplier = MIN_ORDER_SIZE_MULTIPLIER + 
+                       ((1 - clampedPosition) * (MAX_ORDER_SIZE_MULTIPLIER - MIN_ORDER_SIZE_MULTIPLIER));
+    }
+    
+    // Calculate final size
+    const size = BASE_ORDER_SIZE * sizeMultiplier;
+    
+    // Make sure we're not below the minimum lot size if we have instrument info
+    if (this.instrumentInfo) {
+      const minSizeInBTC = this.getLotSize();
+      return Math.max(size, minSizeInBTC);
+    }
+    
+    return size;
+  }
+
+  /**
+   * Start automatic grid shift check interval
+   */
+  startAutoGridShiftCheck(): void {
+    if (!INFINITY_GRID_ENABLED) {
+      this.logger.info('Infinity grid feature is disabled, not starting auto grid shift check');
+      return;
+    }
+
+    if (this.autoShiftCheckIntervalId) {
+      clearInterval(this.autoShiftCheckIntervalId);
+    }
+
+    this.logger.info(`Starting auto grid shift check (every ${GRID_AUTO_SHIFT_CHECK_INTERVAL / 1000} seconds)`);
+    this.autoShiftCheckIntervalId = setInterval(() => {
+      this.checkAndShiftGrid().catch(error => {
+        this.logger.error(`Error in auto grid shift check: ${error}`);
+      });
+    }, GRID_AUTO_SHIFT_CHECK_INTERVAL);
+  }
+
+  /**
+   * Stop automatic grid shift check
+   */
+  stopAutoGridShiftCheck(): void {
+    if (this.autoShiftCheckIntervalId) {
+      clearInterval(this.autoShiftCheckIntervalId);
+      this.autoShiftCheckIntervalId = null;
+      this.logger.info('Stopped auto grid shift check');
+    }
+  }
+
+  /**
+   * Check if the grid needs to be shifted based on current market price
+   * and shift it if necessary
+   */
+  async checkAndShiftGrid(): Promise<void> {
+    if (!INFINITY_GRID_ENABLED || !this.gridInitialized) {
+      return;
+    }
+
+    // Don't shift the grid if we've recently done so
+    const now = Date.now();
+    if (now - this.lastGridShiftTimestamp < this.GRID_SHIFT_THROTTLE_MS) {
+      return;
+    }
+
+    const currentPrice = this.currentMarketPrice;
+    
+    // Calculate grid boundaries with threshold
+    const effectiveLowerBound = this.gridLowerBound + (this.gridLowerBound * GRID_SHIFT_THRESHOLD);
+    const effectiveUpperBound = this.gridUpperBound - (this.gridUpperBound * GRID_SHIFT_THRESHOLD);
+    
+    let shiftDirection: 'up' | 'down' | null = null;
+    
+    // Check if price is below the lower threshold or above the upper threshold
+    if (currentPrice < effectiveLowerBound) {
+      shiftDirection = 'down';
+    } else if (currentPrice > effectiveUpperBound) {
+      shiftDirection = 'up';
+    }
+    
+    if (shiftDirection) {
+      this.logger.star(`Market price (${currentPrice.toFixed(2)}) has moved ${shiftDirection === 'up' ? 'above' : 'below'} the grid boundary`);
+      this.logger.info(`Current grid range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+      await this.shiftGrid(shiftDirection);
+    }
+  }
+
+  /**
+   * Shift the grid up or down in response to price movements
+   */
+  async shiftGrid(direction: 'up' | 'down'): Promise<void> {
+    if (!this.gridInitialized) {
+      this.logger.warn('Cannot shift grid - grid is not initialized');
+      return;
+    }
+    
+    this.lastGridShiftTimestamp = Date.now();
+    
+    // Get current grid spacing
+    const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
+    const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+    
+    // Calculate new reference price
+    let newReferencePrice: number;
+    
+    if (direction === 'up') {
+      // Calculate the new reference price by shifting up
+      // We shift up by a percentage of the current grid size
+      const gridSize = this.gridUpperBound - this.referencePrice;
+      const shiftAmount = gridSize * (1 - GRID_SHIFT_OVERLAP);
+      newReferencePrice = this.referencePrice + shiftAmount;
+      
+      this.logger.info(`Shifting grid UP by ${shiftAmount.toFixed(2)} from ${this.referencePrice.toFixed(2)} to ${newReferencePrice.toFixed(2)}`);
+    } else {
+      // Calculate the new reference price by shifting down
+      // We shift down by a percentage of the current grid size
+      const gridSize = this.referencePrice - this.gridLowerBound;
+      const shiftAmount = gridSize * (1 - GRID_SHIFT_OVERLAP);
+      newReferencePrice = this.referencePrice - shiftAmount;
+      
+      this.logger.info(`Shifting grid DOWN by ${shiftAmount.toFixed(2)} from ${this.referencePrice.toFixed(2)} to ${newReferencePrice.toFixed(2)}`);
+    }
+    
+    // Sort orders by price
+    const buyOrders = this.activeOrders
+      .filter(order => order.side === 'buy' && !order.filled)
+      .sort((a, b) => b.price - a.price); // Sort by price descending
+      
+    const sellOrders = this.activeOrders
+      .filter(order => order.side === 'sell' && !order.filled)
+      .sort((a, b) => a.price - b.price); // Sort by price ascending
+    
+    // Determine orders to keep and orders to cancel
+    const ordersToCancel: Order[] = [];
+    
+    if (direction === 'up') {
+      // When shifting up, we cancel lower buy orders and keep upper ones
+      const keepCount = Math.floor(buyOrders.length * GRID_SHIFT_OVERLAP);
+      const cancelCount = buyOrders.length - keepCount;
+      
+      if (cancelCount > 0 && buyOrders.length > 0) {
+        // Cancel lowest buy orders
+        ordersToCancel.push(...buyOrders.slice(keepCount));
+        this.logger.info(`Will cancel ${cancelCount} lowest buy orders and create new sell orders`);
+      }
+    } else {
+      // When shifting down, we cancel higher sell orders and keep lower ones
+      const keepCount = Math.floor(sellOrders.length * GRID_SHIFT_OVERLAP);
+      const cancelCount = sellOrders.length - keepCount;
+      
+      if (cancelCount > 0 && sellOrders.length > 0) {
+        // Cancel highest sell orders
+        ordersToCancel.push(...sellOrders.slice(keepCount));
+        this.logger.info(`Will cancel ${cancelCount} highest sell orders and create new buy orders`);
+      }
+    }
+    
+    // Cancel orders that are no longer needed
+    if (ordersToCancel.length > 0) {
+      for (const order of ordersToCancel) {
+        try {
+          if (!this.isDryRun) {
+            await this.api.cancelOrder(order.bitmexOrderId as string);
+          }
+          
+          // Remove from active orders
+          this.activeOrders = this.activeOrders.filter(o => o.id !== order.id);
+          
+          this.logger.success(`Cancelled ${order.side} order at ${order.price} as part of grid shift`);
+        } catch (error) {
+          this.logger.error(`Failed to cancel order as part of grid shift: ${error}`);
+        }
+      }
+    }
+    
+    // Update reference price and grid boundaries
+    this.referencePrice = this.roundPriceToTickSize(newReferencePrice);
+    this.gridLowerBound = this.referencePrice - (downwardGridSpacing * ORDER_COUNT);
+    this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
+    
+    // Create new orders in the shifted grid area
+    if (direction === 'up') {
+      // Create new sell orders above the current ones
+      const highestSellPrice = sellOrders.length > 0 ? sellOrders[sellOrders.length - 1].price : this.referencePrice;
+      let currentSellPrice = highestSellPrice;
+      
+      for (let i = 0; i < ordersToCancel.length; i++) {
+        currentSellPrice += upwardGridSpacing;
+        const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
+        
+        try {
+          const order = await this.createOrder(roundedSellPrice, BASE_ORDER_SIZE, 'sell', null);
+          order.entryPrice = this.referencePrice;
+          this.logger.success(`Created new sell order at ${roundedSellPrice} as part of grid shift`);
+          
+          // Brief delay to avoid rate limits
+          if (i < ordersToCancel.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+        } catch (error) {
+          this.logger.error(`Failed to create sell order at ${roundedSellPrice}: ${error}`);
+        }
+      }
+    } else {
+      // Create new buy orders below the current ones
+      const lowestBuyPrice = buyOrders.length > 0 ? buyOrders[buyOrders.length - 1].price : this.referencePrice;
+      let currentBuyPrice = lowestBuyPrice;
+      
+      for (let i = 0; i < ordersToCancel.length; i++) {
+        currentBuyPrice -= downwardGridSpacing;
+        const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
+        
+        try {
+          await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
+          this.logger.success(`Created new buy order at ${roundedBuyPrice} as part of grid shift`);
+          
+          // Brief delay to avoid rate limits
+          if (i < ordersToCancel.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+        } catch (error) {
+          this.logger.error(`Failed to create buy order at ${roundedBuyPrice}: ${error}`);
+        }
+      }
+    }
+    
+    // Update state
+    if (this.stateManager) {
+      await this.stateManager.updateReferencePrice(this.referencePrice);
+    }
+    
+    // Record metrics if available
+    if (this.metricsManager) {
+      this.metricsManager.recordGridDistance(upwardGridSpacing);
+    }
+    
+    this.logger.star(`Grid successfully shifted ${direction.toUpperCase()}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
   }
 } 

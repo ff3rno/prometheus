@@ -7,6 +7,7 @@ import { LiveWebSocket } from './live_websocket';
 import { BitMEXAPI } from './bitmex_api';
 import { StateManager } from './state_manager';
 import { MetricsManager, MetricsConfig } from './metrics_manager';
+import { INFINITY_GRID_ENABLED, VARIABLE_ORDER_SIZE_ENABLED, ORDER_SIZE_PRICE_RANGE_FACTOR, MAX_ORDER_SIZE_MULTIPLIER, MIN_ORDER_SIZE_MULTIPLIER } from './constants';
 
 // Load environment variables
 dotenv.config();
@@ -43,6 +44,20 @@ const run = async (): Promise<void> => {
     // Log configuration details
     logger.info(`Trading symbol: ${SYMBOL}`);
     logger.info(`Data directory: ${DATA_DIR}`);
+    
+    // Log information about dynamic features
+    if (INFINITY_GRID_ENABLED) {
+      logger.star('Infinity Grid Mode: ENABLED - Grid will automatically shift to follow price trends');
+    } else {
+      logger.info('Infinity Grid Mode: DISABLED - Grid will remain fixed at initialization price');
+    }
+    
+    if (VARIABLE_ORDER_SIZE_ENABLED) {
+      logger.star('Variable Order Size: ENABLED - Order sizes will adapt to price levels');
+      logger.info(`Order size range: ${MIN_ORDER_SIZE_MULTIPLIER.toFixed(2)}x - ${MAX_ORDER_SIZE_MULTIPLIER.toFixed(2)}x across ${ORDER_SIZE_PRICE_RANGE_FACTOR.toFixed(2)}x grid range`);
+    } else {
+      logger.info('Variable Order Size: DISABLED - All orders will use the same size');
+    }
     
     if (DRY_RUN) {
       logger.warn('RUNNING IN DRY RUN MODE - NO REAL ORDERS WILL BE PLACED');
