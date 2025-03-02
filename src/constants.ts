@@ -8,17 +8,17 @@ export const ORDER_SIZE = 0.005 // Size of each order in BTC (for FFWCSX instrum
 
 // Safety measures
 export const MAX_POSITION_SIZE_BTC = 0.1 // Maximum allowed position size in BTC
-export const MAX_OPEN_ORDERS = 40 // Maximum number of open orders allowed
+export const MAX_OPEN_ORDERS = 30 // Maximum number of open orders allowed
 export const DEAD_MAN_SWITCH_INTERVAL = 1000 * 60 * 1 // Reset dead man's switch every minute
 export const DEAD_MAN_SWITCH_TIMEOUT = 1000 * 60 * 2 // Cancel all orders after 2 minutes of inactivity
 
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation
 export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing
-export const ATR_MINIMUM_GRID_DISTANCE = 50 // Minimum grid distance in USD
-export const ATR_MAXIMUM_GRID_DISTANCE = 250 // Maximum grid distance in USD
+export const ATR_MINIMUM_GRID_DISTANCE = 60 // Minimum grid distance in USD
+export const ATR_MAXIMUM_GRID_DISTANCE = 225 // Maximum grid distance in USD
 export const ATR_RECALCULATION_INTERVAL =  1000 * 60 * 15 // Recalculate ATR
-export const ATR_HISTORICAL_TRADES_LOOKBACK = 60 // How many minutes to look back for historical trades
+export const ATR_HISTORICAL_TRADES_LOOKBACK = 90 // How many minutes to look back for historical trades
 
 // Trend analyzer parameters
 export const TREND_RSI_PERIOD = 14 // RSI period for trend detection
