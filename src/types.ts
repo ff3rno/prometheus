@@ -296,4 +296,49 @@ export interface GridSizingConfig {
   asymmetryFactor?: number
   upwardGridSpacing?: number // Spacing for orders above current price
   downwardGridSpacing?: number // Spacing for orders below current price
+}
+
+export interface PositionMetrics {
+  size: number
+  direction: string
+  durationMs: number
+  unrealizedPnl: number
+  positionRisk: number
+  entryTimestamp: number
+}
+
+export interface GridLevelMetrics {
+  level: number
+  price: number
+  profit: number
+  tradeCount: number
+  lastTradeTimestamp: number
+}
+
+export interface FillTimeMetrics {
+  level: number
+  price: number
+  timeToFillMs: number
+  side: string
+  timestamp: number
+}
+
+export interface GridBoundaryMetrics {
+  lowerBound: number
+  upperBound: number
+  currentPrice: number
+  hitBoundary: boolean
+  boundaryType: 'upper' | 'lower' | 'none'
+  timestamp: number
+}
+
+export interface GridRebalanceMetrics {
+  direction: 'up' | 'down'
+  oldLowerBound: number
+  oldUpperBound: number
+  newLowerBound: number
+  newUpperBound: number
+  cancelledOrders: number
+  addedOrders: number
+  timestamp: number
 } 

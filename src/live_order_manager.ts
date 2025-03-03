@@ -1,4 +1,4 @@
-import { Order, CompletedTrade, BitMEXInstrument, BitMEXOrder, BitMEXTrade, BitMEXPosition, GridSizingConfig, Candle } from './types';
+import { Order, CompletedTrade, BitMEXInstrument, BitMEXOrder, BitMEXTrade, BitMEXPosition, GridSizingConfig, Candle, GridLevelMetrics } from './types';
 import { BitMEXAPI } from './bitmex_api';
 import { StatsLogger } from './logger';
 import { StateManager } from './state_manager';
@@ -97,6 +97,11 @@ export class LiveOrderManager {
   private autoShiftCheckIntervalId: NodeJS.Timeout | null = null;
   private lastGridShiftTimestamp: number = 0;
   private readonly GRID_SHIFT_THROTTLE_MS: number = 10000; // Minimum time between grid shifts
+
+  private positionStartTimestamp: number = 0;
+
+  // Adding a map to store grid level metrics for tracking profits at each level
+  private gridLevelMetrics: Map<number, GridLevelMetrics> = new Map();
 
   constructor(
     api: BitMEXAPI,
@@ -207,6 +212,12 @@ export class LiveOrderManager {
       // Start auto grid shift check if infinity grid is enabled
       if (INFINITY_GRID_ENABLED) {
         this.startAutoGridShiftCheck()
+      }
+      
+      // Initialize position start timestamp if we have a position
+      const position = await this.api.getPosition(this.symbol);
+      if (position && position.currentQty !== 0) {
+        this.positionStartTimestamp = Date.now();
       }
       
       this.logger.success('Order manager initialized')
@@ -878,6 +889,53 @@ export class LiveOrderManager {
           totalVolume
         );
         
+        // Record grid level metrics
+        if (this.metricsManager) {
+          try {
+            // Determine grid level based on price
+            const level = this.getPriceGridLevel(order.price);
+            
+            // Get or initialize grid level metrics
+            const existingMetrics = this.gridLevelMetrics.get(level) || {
+              level,
+              price: order.price,
+              profit: 0,
+              tradeCount: 0,
+              lastTradeTimestamp: Date.now()
+            };
+            
+            // Update metrics
+            existingMetrics.profit += netProfit;
+            existingMetrics.tradeCount += 1;
+            existingMetrics.lastTradeTimestamp = Date.now();
+            
+            // Save updated metrics
+            this.gridLevelMetrics.set(level, existingMetrics);
+            
+            // Record in InfluxDB
+            this.metricsManager.recordGridLevelProfitability(
+              level,
+              order.price,
+              netProfit,
+              existingMetrics.tradeCount
+            );
+            
+            // Record fill time distribution
+            const timeToFillMs = durationMs;
+            
+            if (timeToFillMs > 0) {
+              this.metricsManager.recordFillTimeDistribution(
+                level,
+                order.price,
+                timeToFillMs,
+                order.side
+              );
+            }
+          } catch (error) {
+            this.logger.error(`Failed to record grid level metrics: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
         // Record grid stats metrics
         if (this.metricsManager) {
           try {
@@ -1333,6 +1391,11 @@ export class LiveOrderManager {
     }, SYNC_INTERVAL_MS);
     
     this.logger.info(`Started periodic sync every ${SYNC_INTERVAL_MS / 1000} seconds`);
+    
+    // Also start recording position metrics periodically
+    setInterval(() => {
+      this.recordPositionMetrics();
+    }, 30000); // Every 30 seconds
   }
   
   /**
@@ -2108,6 +2171,32 @@ export class LiveOrderManager {
     const effectiveLowerBound = this.gridLowerBound + ((this.gridUpperBound - this.gridLowerBound) * GRID_SHIFT_THRESHOLD);
     const effectiveUpperBound = this.gridUpperBound - ((this.gridUpperBound - this.gridLowerBound) * GRID_SHIFT_THRESHOLD);
     
+    // Record grid boundary metrics regardless of whether a shift happens
+    if (this.metricsManager) {
+      try {
+        let boundaryType: 'upper' | 'lower' | 'none' = 'none';
+        let hitBoundary = false;
+        
+        if (currentPrice < effectiveLowerBound) {
+          boundaryType = 'lower';
+          hitBoundary = true;
+        } else if (currentPrice > effectiveUpperBound) {
+          boundaryType = 'upper';
+          hitBoundary = true;
+        }
+        
+        this.metricsManager.recordGridBoundaryMetrics(
+          this.gridLowerBound,
+          this.gridUpperBound,
+          currentPrice,
+          hitBoundary,
+          boundaryType
+        );
+      } catch (error) {
+        this.logger.error(`Failed to record grid boundary metrics: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    
     // Check if price is outside the effective grid bounds
     if (currentPrice < effectiveLowerBound || currentPrice > effectiveUpperBound) {
       // Calculate how far the price is from the center of the grid as a percentage
@@ -2134,6 +2223,12 @@ export class LiveOrderManager {
     
     this.lastGridShiftTimestamp = Date.now();
     
+    // Store the old grid boundaries for metrics
+    const oldLowerBound = this.gridLowerBound;
+    const oldUpperBound = this.gridUpperBound;
+    const orderCountBeforeShift = this.activeOrders.filter(order => !order.filled).length;
+    
+    // Get current grid spacing
     // Get current grid spacing
     const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
     const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
@@ -2251,7 +2346,29 @@ export class LiveOrderManager {
     
     // Record metrics if available
     if (this.metricsManager) {
+      // Record grid spacing metrics
       this.metricsManager.recordGridDistance(upwardGridSpacing);
+      
+      // Record grid rebalancing metrics
+      try {
+        const orderCountAfterShift = this.activeOrders.filter(order => !order.filled).length;
+        const cancelledOrdersCount = orderCountBeforeShift;
+        const addedOrdersCount = orderCountAfterShift;
+        
+        this.metricsManager.recordGridRebalancing(
+          direction,
+          oldLowerBound,
+          oldUpperBound,
+          this.gridLowerBound,
+          this.gridUpperBound,
+          cancelledOrdersCount,
+          addedOrdersCount
+        );
+        
+        this.logger.debug(`Recorded grid rebalancing metrics: direction=${direction}, cancelled=${cancelledOrdersCount}, added=${addedOrdersCount}`);
+      } catch (error) {
+        this.logger.error(`Failed to record grid rebalancing metrics: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
     
     this.logger.star(`Grid successfully centered around current price ${this.currentMarketPrice.toFixed(2)}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
@@ -2704,5 +2821,147 @@ export class LiveOrderManager {
     };
     
     this.logger.info(`Started order stats reporting every ${ORDER_STATS_INTERVAL_MS / 1000} seconds`);
+  }
+
+  private recordPositionMetrics(): void {
+    if (!this.metricsManager) return;
+
+    try {
+      const position = this.calculateCurrentPosition();
+      const direction = position.currentQty > 0 ? 'long' : position.currentQty < 0 ? 'short' : 'flat';
+      const absoluteSize = Math.abs(position.currentQty);
+      
+      if (absoluteSize === 0) {
+        this.positionStartTimestamp = 0;
+        return;
+      }
+      
+      // If position start timestamp is not set but we have a position, set it now
+      if (this.positionStartTimestamp === 0 && absoluteSize > 0) {
+        this.positionStartTimestamp = Date.now();
+      }
+      
+      const durationMs = this.positionStartTimestamp > 0 ? Date.now() - this.positionStartTimestamp : 0;
+      const accountBalance = this.getAccountBalance();
+      const avgEntryPrice = position.avgEntryPrice || 0;
+      const positionRisk = accountBalance > 0 ? (absoluteSize * avgEntryPrice) / accountBalance : 0;
+      
+      this.metricsManager.recordPositionMetrics(
+        absoluteSize,
+        direction,
+        durationMs,
+        position.unrealisedPnl || 0,
+        positionRisk
+      );
+      
+      this.logger.debug(`Recorded position metrics: size=${absoluteSize}, direction=${direction}, pnl=${position.unrealisedPnl || 0}`);
+    } catch (error) {
+      this.logger.error(`Failed to record position metrics: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private getAccountBalance(): number {
+    try {
+      // This is a placeholder - you should implement actual account balance retrieval logic
+      // based on your API capabilities or track this separately
+      return 1.0; // Default to 1 BTC if not available
+    } catch (error) {
+      this.logger.error(`Failed to get account balance: ${error instanceof Error ? error.message : String(error)}`);
+      return 1.0;
+    }
+  }
+
+  private calculateCurrentPosition(): BitMEXPosition {
+    // Initialize with default values
+    const defaultPosition: BitMEXPosition = {
+      account: 0,
+      symbol: this.symbol,
+      currency: 'XBt',
+      leverage: 0,
+      currentQty: 0,
+      isOpen: false,
+      timestamp: new Date().toISOString()
+    };
+    
+    // If we're in dry run mode, calculate based on our tracked orders
+    if (this.isDryRun) {
+      let currentQty = 0;
+      
+      // Sum up the quantities from completed trades
+      for (const trade of this.completedTrades) {
+        if (trade.entryOrder.side === 'buy') {
+          currentQty -= trade.entryOrder.contractQty || 0;
+        } else {
+          currentQty += trade.entryOrder.contractQty || 0;
+        }
+        
+        if (trade.exitOrder.side === 'buy') {
+          currentQty += trade.exitOrder.contractQty || 0;
+        } else {
+          currentQty -= trade.exitOrder.contractQty || 0;
+        }
+      }
+      
+      // Add unfilled orders that represent current position
+      for (const order of this.activeOrders) {
+        if (order.filled) {
+          if (order.side === 'buy') {
+            currentQty += order.contractQty || 0;
+          } else {
+            currentQty -= order.contractQty || 0;
+          }
+        }
+      }
+      
+      return {
+        ...defaultPosition,
+        currentQty,
+        isOpen: currentQty !== 0,
+        unrealisedPnl: this.calculateUnrealizedPnl(currentQty)
+      };
+    }
+    
+    // For live mode, we should get the position from the API
+    // This is a placeholder - implement actual API call
+    return defaultPosition;
+  }
+
+  private calculateUnrealizedPnl(currentQty: number): number {
+    if (currentQty === 0 || !this.currentMarketPrice) return 0;
+    
+    // This is a simple calculation and might need refinement based on 
+    // your specific instrument's profit calculation rules
+    const isLong = currentQty > 0;
+    let entryPrice = 0;
+    let entryQty = 0;
+    
+    // Find all filled buy orders that contribute to the current position
+    for (const order of this.activeOrders) {
+      if (order.filled && ((isLong && order.side === 'buy') || (!isLong && order.side === 'sell'))) {
+        entryPrice = ((entryPrice * entryQty) + ((order.entryPrice || 0) * (order.contractQty || 0))) / 
+                     (entryQty + (order.contractQty || 0));
+        entryQty += order.contractQty || 0;
+      }
+    }
+    
+    if (entryPrice === 0 || entryQty === 0) return 0;
+    
+    // Calculate PnL based on position direction
+    if (isLong) {
+      return (this.currentMarketPrice - entryPrice) * entryQty;
+    } else {
+      return (entryPrice - this.currentMarketPrice) * entryQty;
+    }
+  }
+
+  // Helper method to determine grid level based on price
+  private getPriceGridLevel(price: number): number {
+    if (!this.gridInitialized || !this.referencePrice) return 0;
+    
+    const gridDistance = this.getGridDistance();
+    if (gridDistance <= 0) return 0;
+    
+    // Calculate how many grid levels away from reference price
+    return Math.round((price - this.referencePrice) / gridDistance);
   }
 } 

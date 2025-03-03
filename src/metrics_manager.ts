@@ -636,4 +636,162 @@ export class MetricsManager {
     - Time Range: Last 24 hours
 `;
   }
+
+  /**
+   * Record position metrics
+   */
+  public recordPositionMetrics(
+    size: number,
+    direction: string,
+    durationMs: number,
+    unrealizedPnl: number,
+    positionRisk: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('position')
+        .setTag('instrument', this.tradingPair)
+        .setTag('direction', direction)
+        .setField('size', size)
+        .setField('duration_ms', durationMs)
+        .setField('unrealized_pnl', unrealizedPnl)
+        .setField('risk_exposure', positionRisk);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Position metrics: size=${size}, direction=${direction}, pnl=${unrealizedPnl}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for position: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record grid level profitability
+   */
+  public recordGridLevelProfitability(
+    level: number,
+    price: number,
+    profit: number,
+    tradeCount: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('grid_level')
+        .setTag('instrument', this.tradingPair)
+        .setTag('level', level.toString())
+        .setField('price', price)
+        .setField('profit', profit)
+        .setField('trade_count', tradeCount);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Grid level profitability: level=${level}, price=${price}, profit=${profit}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for grid level: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record fill time distribution
+   */
+  public recordFillTimeDistribution(
+    level: number,
+    price: number,
+    timeToFillMs: number,
+    side: string
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('fill_time')
+        .setTag('instrument', this.tradingPair)
+        .setTag('level', level.toString())
+        .setTag('side', side)
+        .setField('price', price)
+        .setField('time_to_fill_ms', timeToFillMs);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Fill time: level=${level}, price=${price}, time=${timeToFillMs}ms`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for fill time: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record grid boundary metrics
+   */
+  public recordGridBoundaryMetrics(
+    lowerBound: number,
+    upperBound: number,
+    currentPrice: number,
+    hitBoundary: boolean,
+    boundaryType: 'upper' | 'lower' | 'none'
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('grid_boundary')
+        .setTag('instrument', this.tradingPair)
+        .setTag('boundary_type', boundaryType)
+        .setField('lower_bound', lowerBound)
+        .setField('upper_bound', upperBound)
+        .setField('current_price', currentPrice)
+        .setField('hit_boundary', hitBoundary ? 1 : 0)
+        .setField('distance_pct', boundaryType === 'upper' 
+          ? ((upperBound - currentPrice) / currentPrice) * 100
+          : boundaryType === 'lower'
+            ? ((currentPrice - lowerBound) / currentPrice) * 100
+            : 0);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Grid boundary: type=${boundaryType}, hit=${hitBoundary}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for grid boundary: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record grid rebalancing metrics
+   */
+  public recordGridRebalancing(
+    direction: 'up' | 'down',
+    oldLowerBound: number,
+    oldUpperBound: number,
+    newLowerBound: number,
+    newUpperBound: number,
+    cancelledOrders: number,
+    addedOrders: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('grid_rebalance')
+        .setTag('instrument', this.tradingPair)
+        .setTag('direction', direction)
+        .setField('old_lower_bound', oldLowerBound)
+        .setField('old_upper_bound', oldUpperBound)
+        .setField('new_lower_bound', newLowerBound)
+        .setField('new_upper_bound', newUpperBound)
+        .setField('cancelled_orders', cancelledOrders)
+        .setField('added_orders', addedOrders)
+        .setField('shift_size_pct', direction === 'up' 
+          ? ((newUpperBound - oldUpperBound) / oldUpperBound) * 100
+          : ((oldLowerBound - newLowerBound) / oldLowerBound) * 100);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Grid rebalancing: direction=${direction}, cancelled=${cancelledOrders}, added=${addedOrders}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for grid rebalancing: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 } 

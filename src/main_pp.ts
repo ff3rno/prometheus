@@ -116,6 +116,17 @@ const run = async (): Promise<void> => {
       logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})${INFLUX_DEBUG ? ' [DEBUG MODE]' : ''}`);
       metricsManager = new MetricsManager(logger, metricsConfig, SYMBOL);
       
+      // Log metrics capabilities
+      logger.info('Metrics tracking enabled for:');
+      logger.info('- Trade performance (profit/loss, fees, volume)');
+      logger.info('- Order execution (creation, fills, cancellations)');
+      logger.info('- Grid statistics (distance, trend adaptation)');
+      logger.info('- Position metrics (size, direction, duration, P&L)');
+      logger.info('- Grid level profitability (which levels generate most profit)');
+      logger.info('- Fill time distribution (time between fills at each level)');
+      logger.info('- Grid boundary efficiency (how often price hits boundaries)');
+      logger.info('- Grid rebalancing metrics (frequency and impact of shifts)');
+      
       // Enable additional debug logging if in debug mode
       if (INFLUX_DEBUG) {
         logger.info('Metrics debug mode enabled, additional verbose logging will be shown');
