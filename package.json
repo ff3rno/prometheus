@@ -5,9 +5,12 @@
   "main": "dist/main_pp.js",
   "scripts": {
     "build": "tsc",
-    "start": "ts-node src/main_pp.ts",
+    "start:pp": "ts-node src/main_pp.ts",
+    "start:sec-monitor": "ts-node src/main_sec_monitor.ts",
     "dry-run": "cross-env DRY_RUN=true ts-node src/main_pp.ts",
-    "print-orders": "ts-node src/main_print_orders.ts"
+    "print-orders": "ts-node src/main_print_orders.ts",
+    "sec-monitor": "ts-node src/main_sec_monitor.ts",
+    "sec-monitor:build": "tsc && node dist/main_sec_monitor.js"
   },
   "author": "",
   "license": "MIT",
@@ -16,13 +19,17 @@
     "axios": "^1.8.1",
     "bfx-hf-indicators": "^2.0.8",
     "bottleneck": "^2.19.5",
+    "cheerio": "^1.0.0",
     "dotenv": "^16.3.1",
     "fast-xml-parser": "^5.0.8",
     "lowdb": "^6.1.1",
+    "openai": "^4.86.1",
     "signale": "^1.4.0",
-    "ws": "^8.14.2"
+    "ws": "^8.14.2",
+    "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/cheerio": "^0.22.35",
     "@types/node": "^20.10.0",
     "@types/signale": "^1.4.5",
     "@types/ws": "^8.5.10",

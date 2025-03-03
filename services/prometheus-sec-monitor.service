@@ -1,0 +1,23 @@
+[Unit]
+Description=Prometheus SEC Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/prometheus
+ExecStart=/home/ubuntu/prometheus/start-sec-monitor.sh
+KillMode=process
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=prometheus-sec-monitor
+LimitNOFILE=4096
+IgnoreSIGPIPE=false
+Environment=NODE_ENV=production
+Environment=SLACK_AUTH_TOKEN=
+Environment=SLACK_SEC_MONITOR_CHANNEL=#sec-monitor
+
+[Install]
+WantedBy=multi-user.target 
