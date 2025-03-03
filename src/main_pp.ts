@@ -122,6 +122,7 @@ const run = async (): Promise<void> => {
       logger.info('- Order execution (creation, fills, cancellations)');
       logger.info('- Grid statistics (distance, trend adaptation)');
       logger.info('- Position metrics (size, direction, duration, P&L)');
+      logger.info('- Open position tracking (real-time position data)');
       logger.info('- Grid level profitability (which levels generate most profit)');
       logger.info('- Fill time distribution (time between fills at each level)');
       logger.info('- Grid boundary efficiency (how often price hits boundaries)');

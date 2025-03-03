@@ -211,7 +211,7 @@ export class MetricsManager {
   /**
    * Record order cancellation
    */
-  public recordOrderCancellation(orderId: number, side: string, price: number, size: number, reason: string): void {
+  public recordOrderCancellation(orderId: number, side: string, price: number, size: number): void {
     if (!this.enabled || !this.client) return;
 
     try {
@@ -220,7 +220,6 @@ export class MetricsManager {
         .setTag('side', side)
         .setTag('order_id', orderId.toString())
         .setTag('action', 'cancellation')
-        .setTag('reason', reason)
         .setField('price', price)
         .setField('size', size)
         .setField('notional_value', price * size);
@@ -664,6 +663,41 @@ export class MetricsManager {
       }
     } catch (error) {
       this.logger.error(`Error creating metrics for position: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  public recordOpenPosition(
+    size: number,
+    entryPrice: number,
+    markPrice: number, 
+    liquidationPrice: number | null,
+    leverage: number,
+    marginUsed: number,
+    unrealizedPnl: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('open_position')
+        .setTag('instrument', this.tradingPair)
+        .setTag('direction', size > 0 ? 'long' : size < 0 ? 'short' : 'flat')
+        .setField('size', size)
+        .setField('entry_price', entryPrice)
+        .setField('mark_price', markPrice)
+        .setField('unrealized_pnl', unrealizedPnl)
+        .setField('leverage', leverage)
+        .setField('margin_used', marginUsed);
+      
+      if (liquidationPrice !== null) {
+        point.setField('liquidation_price', liquidationPrice);
+      }
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `Open position: ${size} @ ${entryPrice}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for open position: ${error}`);
     }
   }
 

@@ -1394,7 +1394,7 @@ export class LiveOrderManager {
     
     // Also start recording position metrics periodically
     setInterval(() => {
-      this.recordPositionMetrics();
+      this.recordOpenPositionMetrics();
     }, 30000); // Every 30 seconds
   }
   
@@ -2270,8 +2270,7 @@ export class LiveOrderManager {
                 order.id,
                 order.side,
                 order.price,
-                order.size,
-                'grid_shift'
+                order.size
               );
             } catch (error) {
               this.logger.error(`Failed to record order cancellation metrics: ${error instanceof Error ? error.message : String(error)}`);
@@ -2746,8 +2745,7 @@ export class LiveOrderManager {
               order.id,
               order.side,
               order.price,
-              order.size,
-              'bulk_cancel'
+              order.size
             );
           } catch (error) {
             this.logger.error(`Failed to record order cancellation metrics: ${error instanceof Error ? error.message : String(error)}`);
@@ -2767,184 +2765,137 @@ export class LiveOrderManager {
    * Start periodic order stats reporting
    */
   private startOrderStatsReporting(): void {
-    if (!this.metricsManager) return;
-    
-    const ORDER_STATS_INTERVAL_MS = 30000; // 30 seconds
-    
-    // Track order counts for metrics
-    let createdOrdersCount = 0;
-    let filledOrdersCount = 0;
-    let cancelledOrdersCount = 0;
-    
-    // Create a listener for order creation
-    const originalCreateOrder = this.createOrder.bind(this);
-    this.createOrder = async (price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> => {
-      const order = await originalCreateOrder(price, size, side, oppositeOrderPrice);
-      createdOrdersCount++;
-      return order;
-    };
-    
-    // Start the interval
+    // Report order stats every 30 seconds
     setInterval(() => {
-      try {
-        // Calculate active order stats
-        const activeBuyOrders = this.activeOrders.filter(o => o.side === 'buy' && !o.filled).length;
-        const activeSellOrders = this.activeOrders.filter(o => o.side === 'sell' && !o.filled).length;
+      if (this.metricsManager) {
+        const activeOrders = this.activeOrders.length;
+        const activeBuyOrders = this.activeOrders.filter(o => o.side === 'buy').length;
+        const activeSellOrders = this.activeOrders.filter(o => o.side === 'sell').length;
+
+        // Track order counts directly from the class
+        // We'll maintain these counts in the class itself
+        const ordersCreated = this.completedTrades.length + activeOrders;
+        const ordersFilled = this.completedTrades.length;
+        const ordersCancelled = 0; // This would need to be tracked separately
         
-        // Record stats
-        this.metricsManager?.recordOrderStats(
-          this.activeOrders.filter(o => !o.filled).length,
+        this.metricsManager.recordOrderStats(
+          activeOrders,
           activeBuyOrders,
           activeSellOrders,
-          createdOrdersCount,
-          filledOrdersCount,
-          cancelledOrdersCount
+          ordersCreated,
+          ordersFilled,
+          ordersCancelled
         );
-      } catch (error) {
-        this.logger.error(`Failed to record order stats: ${error instanceof Error ? error.message : String(error)}`);
+
+        // Also record position information
+        this.recordOpenPositionMetrics();
       }
-    }, ORDER_STATS_INTERVAL_MS);
-    
-    // Monitor fill and cancellation events
-    const originalFillOrder = this.fillOrder.bind(this);
-    this.fillOrder = async (order: Order, executionPrice: number): Promise<void> => {
-      await originalFillOrder(order, executionPrice);
-      filledOrdersCount++;
-    };
-    
-    // Add a hook to count cancellations in cancelAllOrders
-    const originalCancelAll = this.cancelAllOrders.bind(this);
-    this.cancelAllOrders = async (): Promise<void> => {
-      const cancelCount = this.activeOrders.filter(o => !o.filled).length;
-      await originalCancelAll();
-      cancelledOrdersCount += cancelCount;
-    };
-    
-    this.logger.info(`Started order stats reporting every ${ORDER_STATS_INTERVAL_MS / 1000} seconds`);
+    }, 30000); // Every 30 seconds
   }
 
-  private recordPositionMetrics(): void {
+  private recordOpenPositionMetrics(): void {
     if (!this.metricsManager) return;
-
-    try {
-      const position = this.calculateCurrentPosition();
-      const direction = position.currentQty > 0 ? 'long' : position.currentQty < 0 ? 'short' : 'flat';
-      const absoluteSize = Math.abs(position.currentQty);
-      
-      if (absoluteSize === 0) {
-        this.positionStartTimestamp = 0;
-        return;
-      }
-      
-      // If position start timestamp is not set but we have a position, set it now
-      if (this.positionStartTimestamp === 0 && absoluteSize > 0) {
-        this.positionStartTimestamp = Date.now();
-      }
-      
-      const durationMs = this.positionStartTimestamp > 0 ? Date.now() - this.positionStartTimestamp : 0;
-      const accountBalance = this.getAccountBalance();
-      const avgEntryPrice = position.avgEntryPrice || 0;
-      const positionRisk = accountBalance > 0 ? (absoluteSize * avgEntryPrice) / accountBalance : 0;
-      
-      this.metricsManager.recordPositionMetrics(
-        absoluteSize,
-        direction,
-        durationMs,
-        position.unrealisedPnl || 0,
-        positionRisk
-      );
-      
-      this.logger.debug(`Recorded position metrics: size=${absoluteSize}, direction=${direction}, pnl=${position.unrealisedPnl || 0}`);
-    } catch (error) {
-      this.logger.error(`Failed to record position metrics: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  private getAccountBalance(): number {
-    try {
-      // This is a placeholder - you should implement actual account balance retrieval logic
-      // based on your API capabilities or track this separately
-      return 1.0; // Default to 1 BTC if not available
-    } catch (error) {
-      this.logger.error(`Failed to get account balance: ${error instanceof Error ? error.message : String(error)}`);
-      return 1.0;
-    }
-  }
-
-  private calculateCurrentPosition(): BitMEXPosition {
-    // Initialize with default values
-    const defaultPosition: BitMEXPosition = {
-      account: 0,
-      symbol: this.symbol,
-      currency: 'XBt',
-      leverage: 0,
-      currentQty: 0,
-      isOpen: false,
-      timestamp: new Date().toISOString()
-    };
     
-    // If we're in dry run mode, calculate based on our tracked orders
-    if (this.isDryRun) {
+    try {
+      // Calculate position from trades and orders
       let currentQty = 0;
+      let entryPrice = 0;
+      let totalSize = 0;
+      let totalValue = 0;
       
-      // Sum up the quantities from completed trades
+      // Calculate position from completed trades
       for (const trade of this.completedTrades) {
-        if (trade.entryOrder.side === 'buy') {
-          currentQty -= trade.entryOrder.contractQty || 0;
-        } else {
-          currentQty += trade.entryOrder.contractQty || 0;
-        }
+        // Use entry and exit orders from CompletedTrade
+        const entryQty = trade.entryOrder?.contractQty || trade.entryOrder?.size || 0;
+        const entrySide = trade.entryOrder?.side || 'buy';
+        const entryTradePrice = trade.entryOrder?.price || 0;
         
-        if (trade.exitOrder.side === 'buy') {
-          currentQty += trade.exitOrder.contractQty || 0;
-        } else {
-          currentQty -= trade.exitOrder.contractQty || 0;
+        // Add to position (buys increase, sells decrease)
+        currentQty += entrySide === 'buy' ? entryQty : -entryQty;
+        
+        // Add to total value for average calculation
+        if ((currentQty > 0 && entrySide === 'buy') || (currentQty < 0 && entrySide === 'sell')) {
+          totalSize += entryQty;
+          totalValue += entryQty * entryTradePrice;
         }
       }
       
-      // Add unfilled orders that represent current position
-      for (const order of this.activeOrders) {
-        if (order.filled) {
-          if (order.side === 'buy') {
-            currentQty += order.contractQty || 0;
-          } else {
-            currentQty -= order.contractQty || 0;
-          }
-        }
+      // Calculate average entry price
+      entryPrice = totalSize > 0 ? totalValue / totalSize : this.currentMarketPrice;
+      
+      // Calculate margin used
+      const leverage = 10; // Default leverage
+      const contractValue = Math.abs(currentQty) / this.currentMarketPrice;
+      const marginUsed = contractValue / leverage;
+      
+      // Calculate unrealized PnL
+      let unrealizedPnl = 0;
+      if (currentQty !== 0 && entryPrice > 0) {
+        const sizeBTC = Math.abs(currentQty) / this.currentMarketPrice;
+        unrealizedPnl = currentQty > 0 
+          ? (this.currentMarketPrice - entryPrice) * sizeBTC 
+          : (entryPrice - this.currentMarketPrice) * sizeBTC;
       }
       
-      return {
-        ...defaultPosition,
+      // Prepare liquidation price (approximate calculation)
+      const liquidationPrice = currentQty !== 0 
+        ? currentQty > 0 
+          ? entryPrice * (1 - 1/leverage) 
+          : entryPrice * (1 + 1/leverage)
+        : null;
+      
+      // Record position metrics
+      this.metricsManager.recordOpenPosition(
         currentQty,
-        isOpen: currentQty !== 0,
-        unrealisedPnl: this.calculateUnrealizedPnl(currentQty)
-      };
+        entryPrice,
+        this.currentMarketPrice,
+        liquidationPrice,
+        leverage,
+        marginUsed,
+        unrealizedPnl
+      );
+    } catch (error) {
+      this.logger.error(`Error recording open position metrics: ${error}`);
     }
+  }
+
+  private getPriceGridLevel(price: number): number {
+    if (!this.gridInitialized || !this.referencePrice) return 0;
     
-    // For live mode, we should get the position from the API
-    // This is a placeholder - implement actual API call
-    return defaultPosition;
+    const gridDistance = this.getGridDistance();
+    if (gridDistance <= 0) return 0;
+    
+    // Calculate how many grid levels away from reference price
+    return Math.round((price - this.referencePrice) / gridDistance);
   }
 
   private calculateUnrealizedPnl(currentQty: number): number {
     if (currentQty === 0 || !this.currentMarketPrice) return 0;
     
-    // This is a simple calculation and might need refinement based on 
-    // your specific instrument's profit calculation rules
     const isLong = currentQty > 0;
     let entryPrice = 0;
     let entryQty = 0;
     
-    // Find all filled buy orders that contribute to the current position
+    // Find filled orders that contribute to the current position
     for (const order of this.activeOrders) {
       if (order.filled && ((isLong && order.side === 'buy') || (!isLong && order.side === 'sell'))) {
-        entryPrice = ((entryPrice * entryQty) + ((order.entryPrice || 0) * (order.contractQty || 0))) / 
-                     (entryQty + (order.contractQty || 0));
-        entryQty += order.contractQty || 0;
+        const qty = order.contractQty || 0;
+        const price = order.entryPrice || 0;
+        
+        if (entryQty > 0) {
+          entryPrice = ((entryPrice * entryQty) + (price * qty)) / (entryQty + qty);
+        } else {
+          entryPrice = price;
+        }
+        entryQty += qty;
       }
     }
-    
-    if (entryPrice === 0 || entryQty === 0) return 0;
+
+    // If we couldn't determine entry price/qty, use a fallback
+    if (entryPrice === 0 || entryQty === 0) {
+      entryPrice = this.currentMarketPrice;
+      entryQty = Math.abs(currentQty);
+    }
     
     // Calculate PnL based on position direction
     if (isLong) {
@@ -2954,14 +2905,71 @@ export class LiveOrderManager {
     }
   }
 
-  // Helper method to determine grid level based on price
-  private getPriceGridLevel(price: number): number {
-    if (!this.gridInitialized || !this.referencePrice) return 0;
-    
-    const gridDistance = this.getGridDistance();
-    if (gridDistance <= 0) return 0;
-    
-    // Calculate how many grid levels away from reference price
-    return Math.round((price - this.referencePrice) / gridDistance);
+  private calculateCurrentPosition(): BitMEXPosition {
+    // Define default position
+    const defaultPosition: BitMEXPosition = {
+      symbol: this.symbol,
+      currentQty: 0,
+      leverage: 0,
+      isOpen: false,
+      account: 0,
+      currency: 'XBt',
+      timestamp: new Date().toISOString()
+    };
+
+    // For simulation mode, calculate position from completed trades
+    if (this.isDryRun) {
+      // Calculate current position quantity from completed trades
+      const currentQty = this.completedTrades.reduce((qty, trade) => {
+        const entrySize = trade.entryOrder?.size || 0;
+        const entrySide = trade.entryOrder?.side || 'buy';
+        return qty + (entrySide === 'buy' ? entrySize : -entrySize);
+      }, 0);
+
+      if (currentQty === 0) {
+        return defaultPosition;
+      }
+
+      // Calculate average entry price (weighted by size)
+      let totalSize = 0;
+      let totalValue = 0;
+
+      // Only consider trades in the direction of the current position
+      const relevantTrades = this.completedTrades.filter(trade => {
+        const side = trade.entryOrder?.side;
+        return (currentQty > 0 && side === 'buy') || (currentQty < 0 && side === 'sell');
+      });
+
+      for (const trade of relevantTrades) {
+        const size = trade.entryOrder?.size || 0;
+        const price = trade.entryOrder?.price || 0;
+        totalSize += size;
+        totalValue += size * price;
+      }
+
+      const avgEntryPrice = totalSize > 0 ? totalValue / totalSize : 0;
+      const unrealisedPnl = this.calculateUnrealizedPnl(currentQty);
+      
+      // Calculate margin used - this is an approximation
+      const leverage = 10; // Assuming 10x leverage for simulation
+      
+      return {
+        ...defaultPosition,
+        currentQty,
+        avgEntryPrice,
+        markPrice: this.currentMarketPrice,
+        unrealisedPnl,
+        leverage,
+        isOpen: currentQty !== 0
+      };
+    }
+
+    // For live mode, try to get position directly (no position in state now)
+    return {
+      ...defaultPosition,
+      currentQty: 0,
+      unrealisedPnl: 0,
+      isOpen: false
+    };
   }
 } 
