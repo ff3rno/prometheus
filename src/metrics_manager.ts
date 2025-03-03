@@ -164,6 +164,7 @@ export class MetricsManager {
         .setTag('instrument', this.tradingPair)
         .setTag('side', side)
         .setTag('order_id', orderId.toString())
+        .setTag('action', 'execution')
         .setField('price', price)
         .setField('size', size)
         .setField('fee', fee)
@@ -175,6 +176,61 @@ export class MetricsManager {
       }
     } catch (error) {
       this.logger.error(`Error creating metrics for order: ${error}`);
+    }
+  }
+
+  /**
+   * Record order creation
+   */
+  public recordOrderCreation(orderId: number, side: string, price: number, size: number, oppositeOrderPrice: number | null = null): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('order')
+        .setTag('instrument', this.tradingPair)
+        .setTag('side', side)
+        .setTag('order_id', orderId.toString())
+        .setTag('action', 'creation')
+        .setField('price', price)
+        .setField('size', size)
+        .setField('notional_value', price * size);
+      
+      if (oppositeOrderPrice !== null) {
+        point.setField('opposite_price', oppositeOrderPrice);
+      }
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `${side} order creation @ ${price}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for order creation: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record order cancellation
+   */
+  public recordOrderCancellation(orderId: number, side: string, price: number, size: number, reason: string): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('order')
+        .setTag('instrument', this.tradingPair)
+        .setTag('side', side)
+        .setTag('order_id', orderId.toString())
+        .setTag('action', 'cancellation')
+        .setTag('reason', reason)
+        .setField('price', price)
+        .setField('size', size)
+        .setField('notional_value', price * size);
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, `${side} order cancellation @ ${price}`);
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for order cancellation: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -213,21 +269,49 @@ export class MetricsManager {
       const point = Point.measurement('grid_stats')
         .setTag('instrument', this.tradingPair)
         .setField('total_profit', totalProfit)
-        .setField('total_orders', totalOrders)
-        .setField('buy_orders', buyOrders)
-        .setField('sell_orders', sellOrders)
-        .setField('total_fees', totalFees)
-        .setTimestamp(new Date());
-
+        .setField('total_completed_orders', totalOrders)
+        .setField('buy_entry_trades', buyOrders)
+        .setField('sell_entry_trades', sellOrders)
+        .setField('total_fees', totalFees);
+        
       const lineProtocol = point.toLineProtocol();
       if (lineProtocol) {
-        this.logger.info(`Recording grid stats: profit=${totalProfit}, orders=${totalOrders}, fees=${totalFees}`);
-        this.writeData(lineProtocol, 'grid stats snapshot');
-      } else {
-        this.logger.error('Failed to generate line protocol for grid stats');
+        this.writeData(lineProtocol, 'grid stats');
       }
     } catch (error) {
       this.logger.error(`Error creating metrics for grid stats: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Record order stats for monitoring
+   */
+  public recordOrderStats(
+    activeOrders: number, 
+    activeBuyOrders: number, 
+    activeSellOrders: number, 
+    createdOrders: number, 
+    filledOrders: number, 
+    cancelledOrders: number
+  ): void {
+    if (!this.enabled || !this.client) return;
+
+    try {
+      const point = Point.measurement('order_stats')
+        .setTag('instrument', this.tradingPair)
+        .setField('active_orders', activeOrders)
+        .setField('active_buy_orders', activeBuyOrders)
+        .setField('active_sell_orders', activeSellOrders)
+        .setField('created_orders_count', createdOrders)
+        .setField('filled_orders_count', filledOrders)
+        .setField('cancelled_orders_count', cancelledOrders);
+        
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.writeData(lineProtocol, 'order stats');
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for order stats: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -302,7 +386,7 @@ export class MetricsManager {
   }
 
   /**
-   * Close the InfluxDB client connection
+   * Close the metrics client connection
    */
   public close(): void {
     if (!this.client) {
@@ -315,8 +399,7 @@ export class MetricsManager {
       const shutdownPoint = Point.measurement('system')
         .setTag('component', 'prometheus')
         .setTag('status', 'shutdown')
-        .setField('value', 1)
-        .setTimestamp(new Date());
+        .setField('value', 1);
         
       const shutdownLineProtocol = shutdownPoint.toLineProtocol();
       if (shutdownLineProtocol) {
@@ -363,7 +446,7 @@ export class MetricsManager {
       try {
         const heartbeatPoint = Point.measurement('system')
           .setTag('component', 'prometheus')
-          .setTag('type', 'heartbeat')
+          .setTag('status', 'alive')
           .setField('value', 1)
           .setTimestamp(new Date());
           
@@ -458,5 +541,99 @@ export class MetricsManager {
         this.logger.error(`Error in periodic grid stats recording: ${error instanceof Error ? error.message : String(error)}`);
       }
     }, STATS_INTERVAL_MS);
+  }
+
+  /**
+   * Get a template for an InfluxDB dashboard to visualize order metrics
+   * This returns a string describing the recommended panels for a comprehensive order metrics dashboard.
+   */
+  public static getDashboardTemplate(): string {
+    return `
+# Order Metrics Dashboard Template
+
+## Order Activity Panels
+
+1. **Active Orders Count**
+   - Measurement: order_stats
+   - Fields: active_orders, active_buy_orders, active_sell_orders
+   - Visualization: Line graph
+   - Time Range: Last 24 hours
+
+2. **Order Creation Rate**
+   - Measurement: order_stats
+   - Field: created_orders_count
+   - Visualization: Rate graph (derivative)
+   - Time Range: Last 24 hours
+
+3. **Order Events**
+   - Measurement: order
+   - Filter by tag: action
+   - Group by: action (creation, execution, cancellation)
+   - Visualization: Stacked bar chart
+   - Time Range: Last 24 hours
+
+4. **Order Price Distribution**
+   - Measurement: order
+   - Field: price
+   - Group by: side
+   - Visualization: Scatter plot
+   - Time Range: Last 24 hours
+
+5. **Order Size Distribution**
+   - Measurement: order
+   - Field: size
+   - Group by: side
+   - Visualization: Heat map
+   - Time Range: Last 24 hours
+
+6. **Fees Paid**
+   - Measurement: order
+   - Field: fee
+   - Group by: action
+   - Visualization: Cumulative sum
+   - Time Range: Last 24 hours
+
+7. **Trading Volume**
+   - Measurement: order
+   - Field: notional_value
+   - Group by: side
+   - Visualization: Line graph
+   - Time Range: Last 24 hours
+
+## Grid Performance Panels
+
+8. **Grid Profit**
+   - Measurement: grid_stats
+   - Field: total_profit
+   - Visualization: Line graph
+   - Time Range: Last 7 days
+
+9. **Completed Trades**
+   - Measurement: grid_stats
+   - Fields: total_completed_orders, buy_entry_trades, sell_entry_trades
+   - Visualization: Line graph
+   - Time Range: Last 7 days
+
+10. **Profit vs. Fees**
+    - Measurement: grid_stats
+    - Fields: total_profit, total_fees
+    - Visualization: Line graph
+    - Time Range: Last 7 days
+
+## System Health Panels
+
+11. **Heartbeat Status**
+    - Measurement: system
+    - Field: value
+    - Filter by tag: status = 'alive'
+    - Visualization: Status indicator
+    - Time Range: Last 1 hour
+
+12. **Grid Spacing**
+    - Measurement: grid_distance
+    - Field: distance
+    - Visualization: Line graph
+    - Time Range: Last 24 hours
+`;
   }
 } 

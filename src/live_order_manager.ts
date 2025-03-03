@@ -4,10 +4,42 @@ import { StatsLogger } from './logger';
 import { StateManager } from './state_manager';
 import { TrendAnalyzer, TrendAnalysis } from './trend_analyzer';
 import { MetricsManager } from './metrics_manager';
-import { ORDER_DISTANCE, ORDER_COUNT, ORDER_SIZE, MAX_POSITION_SIZE_BTC, MAX_OPEN_ORDERS, ENFORCE_ORDER_DISTANCE, ATR_PERIOD, ATR_MULTIPLIER, ATR_MINIMUM_GRID_DISTANCE, ATR_MAXIMUM_GRID_DISTANCE, ATR_RECALCULATION_INTERVAL, ATR_HISTORICAL_TRADES_LOOKBACK, ORDER_SYNC_INTERVAL, GAP_DETECTION_TOLERANCE, getNextOrderId, FEE_RATE } from './constants';
-import { VARIABLE_ORDER_SIZE_ENABLED, BASE_ORDER_SIZE, MAX_ORDER_SIZE_MULTIPLIER, 
-  MIN_ORDER_SIZE_MULTIPLIER, ORDER_SIZE_PRICE_RANGE_FACTOR, INFINITY_GRID_ENABLED,
-  GRID_SHIFT_THRESHOLD, GRID_SHIFT_OVERLAP, GRID_AUTO_SHIFT_CHECK_INTERVAL } from './constants';
+import { BreakoutDetector } from './breakout_detector';
+import { BreakoutState, BreakoutDirection, BreakoutTradeResult } from './types/breakout';
+import {
+  ORDER_COUNT,
+  ORDER_DISTANCE,
+  ORDER_SIZE,
+  MAX_POSITION_SIZE_BTC,
+  MAX_OPEN_ORDERS,
+  ORDER_SYNC_INTERVAL,
+  ENFORCE_ORDER_DISTANCE,
+  FEE_RATE,
+  getNextOrderId,
+  INFINITY_GRID_ENABLED,
+  GRID_SHIFT_THRESHOLD,
+  GRID_SHIFT_OVERLAP,
+  GRID_AUTO_SHIFT_CHECK_INTERVAL,
+  VARIABLE_ORDER_SIZE_ENABLED,
+  BASE_ORDER_SIZE,
+  MAX_ORDER_SIZE_MULTIPLIER,
+  MIN_ORDER_SIZE_MULTIPLIER,
+  ORDER_SIZE_PRICE_RANGE_FACTOR,
+  ATR_PERIOD, 
+  ATR_MULTIPLIER,
+  ATR_MINIMUM_GRID_DISTANCE,
+  ATR_MAXIMUM_GRID_DISTANCE,
+  GAP_DETECTION_TOLERANCE,
+  ATR_RECALCULATION_INTERVAL,
+  ATR_HISTORICAL_TRADES_LOOKBACK,
+  BREAKOUT_DETECTION_ENABLED,
+  BREAKOUT_ATR_THRESHOLD,
+  BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
+  BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
+  BREAKOUT_TIMEOUT_MINUTES,
+  BREAKOUT_POSITION_SIZE_MULTIPLIER,
+  BREAKOUT_COOLDOWN_MINUTES
+} from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
 export class LiveOrderManager {
@@ -28,6 +60,21 @@ export class LiveOrderManager {
   private atrRecalculationIntervalId: NodeJS.Timeout | null = null;
   private atrInstance: any; // bfx-hf-indicators ATR instance
   private trendAnalyzer: TrendAnalyzer;
+  private breakoutDetector: BreakoutDetector;
+  private breakoutState: BreakoutState = {
+    active: false,
+    direction: null,
+    entryPrice: 0,
+    profitTargetPrice: 0,
+    stopLossPrice: 0,
+    entryTimestamp: 0,
+    timeoutTimestamp: 0,
+    positionSize: 0,
+    orderIds: [],
+    lastBreakoutEndTimestamp: 0
+  };
+  private completedBreakoutTrades: BreakoutTradeResult[] = [];
+  private breakoutCheckIntervalId: NodeJS.Timeout | null = null;
   private gridSizing: GridSizingConfig = {
     useATR: true,
     currentDistance: ORDER_DISTANCE,
@@ -65,8 +112,19 @@ export class LiveOrderManager {
     this.symbol = symbol;
     this.isDryRun = isDryRun;
     this.metricsManager = metricsManager;
+    
+    // Initialize trend analyzer and breakout detector
     this.trendAnalyzer = new TrendAnalyzer(logger);
+    this.breakoutDetector = new BreakoutDetector(logger);
     this.logger.info('LiveOrderManager initialized with TrendAnalyzer for asymmetric grid spacing');
+    
+    if (BREAKOUT_DETECTION_ENABLED) {
+      this.logger.star('Breakout detection ENABLED - Grid trading will pause during strong breakouts');
+    }
+    
+    // Initialize ATR indicator with default configuration
+    // Real data will be loaded in the initialize() method
+    this.atrInstance = new ATR([ATR_PERIOD]);
   }
 
   /**
@@ -74,69 +132,191 @@ export class LiveOrderManager {
    */
   async initialize(): Promise<void> {
     try {
-      // Get instrument info
-      this.instrumentInfo = await this.api.getInstrument(this.symbol);
+      // Fetch instrument info
+      this.instrumentInfo = await this.api.getInstrument(this.symbol)
       
       if (!this.instrumentInfo) {
-        throw new Error(`Could not get instrument info for ${this.symbol}`);
+        throw new Error(`Could not fetch instrument info for ${this.symbol}`)
       }
       
-      // Initialize trend analyzer
-      this.trendAnalyzer = new TrendAnalyzer(this.logger);
+      this.logger.info(`Initialized with instrument: ${this.symbol}`)
+      this.logger.info(`Tick size: ${this.instrumentInfo.tickSize}, Lot size: ${this.instrumentInfo.lotSize}`)
       
-      // Load state from state manager
-      const savedState = this.stateManager.getState();
+      // Initialize ATR with historical market data
+      await this.initializeATRWithHistoricalData()
+      
+      // Load saved state
+      const savedState = this.stateManager.getState()
       
       if (savedState) {
         // Restore grid settings
-        this.gridSizing = savedState.gridSizing || this.gridSizing;
+        this.gridSizing = savedState.gridSizing || this.gridSizing
         
         // Restore order history if present
         if (savedState.completedTrades && Array.isArray(savedState.completedTrades)) {
-          this.completedTrades = savedState.completedTrades;
-          this.logger.info(`Loaded ${this.completedTrades.length} completed trades from state`);
+          this.completedTrades = savedState.completedTrades
+          this.logger.info(`Loaded ${this.completedTrades.length} completed trades from state`)
         }
         
-        this.logger.info('Restored previous state');
-        this.logger.info(`Grid distance: ${this.gridSizing.currentDistance.toFixed(2)}`);
+        this.logger.info('Restored previous state')
+        this.logger.info(`Grid distance: ${this.gridSizing.currentDistance.toFixed(2)}`)
+        
+        // Restore breakout state if available
+        if (savedState.breakoutState) {
+          this.breakoutState = savedState.breakoutState
+          
+          // If we were in an active breakout, check if it's still valid
+          if (this.breakoutState.active) {
+            const now = Date.now()
+            
+            // If the breakout has timed out, reset it
+            if (now > this.breakoutState.timeoutTimestamp) {
+              this.logger.warn('Restored breakout state was active but has timed out - resetting')
+              this.breakoutState.active = false
+              this.breakoutState.direction = null
+            } else {
+              this.logger.star(`Restored active breakout trade: ${this.breakoutState.direction?.toUpperCase()} | Entry: $${this.breakoutState.entryPrice.toFixed(2)}`)
+              
+              // Start the breakout check interval
+              this.startBreakoutCheckInterval()
+            }
+          }
+        }
+        
+        // Restore completed breakout trades if available
+        if (savedState.completedBreakoutTrades && savedState.completedBreakoutTrades.length > 0) {
+          this.completedBreakoutTrades = savedState.completedBreakoutTrades
+          this.logger.info(`Restored ${this.completedBreakoutTrades.length} completed breakout trades from saved state`)
+        }
       }
       
       // Sync with existing orders on the exchange
-      await this.syncWithExchangeOrders();
+      await this.syncWithExchangeOrders()
       
       // Start periodic sync
-      this.startPeriodicSync();
+      this.startPeriodicSync()
       
-      // Initialize periodic grid stats recording if metrics are enabled
+      // Start order stats reporting if metrics manager is available
       if (this.metricsManager) {
-        this.metricsManager.startPeriodicGridStatsRecording(() => {
-          const totalProfit = this.completedTrades.reduce((total, trade) => total + trade.profit, 0);
-          const totalFees = this.completedTrades.reduce((total, trade) => total + trade.fees, 0);
-          const buyEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'buy').length;
-          const sellEntryTrades = this.completedTrades.filter(t => t.entryOrder.side === 'sell').length;
-          
-          return {
-            totalProfit,
-            totalOrders: this.completedTrades.length,
-            buyOrders: buyEntryTrades,
-            sellOrders: sellEntryTrades,
-            totalFees
-          };
-        });
+        this.startOrderStatsReporting()
       }
       
-      // Initialize ATR recalculation
-      this.startATRRecalculationInterval();
+      // Start ATR recalculation interval
+      this.startATRRecalculationInterval()
       
-      // Start the auto grid shift check if infinity grid is enabled
+      // Start auto grid shift check if infinity grid is enabled
       if (INFINITY_GRID_ENABLED) {
-        this.startAutoGridShiftCheck();
+        this.startAutoGridShiftCheck()
       }
       
-      this.logger.success('Order manager initialized');
+      this.logger.success('Order manager initialized')
     } catch (error) {
-      this.logger.error(`Failed to initialize order manager: ${error}`);
-      throw error;
+      this.logger.error(`Failed to initialize LiveOrderManager: ${(error as Error).message}`)
+      throw error
+    }
+  }
+
+  /**
+   * Initialize ATR indicator with actual historical market data from BitMEX
+   */
+  private async initializeATRWithHistoricalData(): Promise<void> {
+    try {
+      this.logger.info(`Initializing ATR indicator with historical market data for ${this.symbol}`)
+      
+      // Fetch historical trades - use a longer lookback for better ATR initialization
+      const lookbackMinutes = Math.max(ATR_HISTORICAL_TRADES_LOOKBACK, ATR_PERIOD * 5)
+      this.logger.info(`Fetching ${lookbackMinutes} minutes of historical trade data...`)
+      
+      const trades = await this.api.getHistoricalTrades(
+        this.symbol,
+        lookbackMinutes,
+        1000 // Fetch more trades for better data quality
+      )
+      
+      if (!trades || trades.length === 0) {
+        this.logger.warn(`No historical trades found for ${this.symbol}, using default ATR values`)
+        return
+      }
+      
+      this.logger.info(`Retrieved ${trades.length} historical trades for ATR calculation`)
+      
+      // Convert trades to candles for ATR calculation
+      const candles = this.tradesIntoCandles(trades)
+      this.candles = candles // Store for future use
+      
+      if (candles.length < ATR_PERIOD + 1) {
+        this.logger.warn(`Not enough candles for proper ATR initialization: ${candles.length} < ${ATR_PERIOD + 1}`)
+        return
+      }
+      
+      // Reset ATR indicator with proper period
+      this.atrInstance = new ATR([ATR_PERIOD])
+      
+      // Feed historical candles to ATR indicator
+      this.logger.info(`Feeding ${candles.length} historical candles to ATR indicator`)
+      
+      // Make sure we're handling different candle formats properly
+      for (const candle of candles) {
+        // Ensure all required properties exist
+        const open = candle.open || candle.close || 0
+        const high = candle.high || candle.close || 0
+        const low = candle.low || candle.close || 0
+        const close = candle.close || 0
+        
+        // Add to ATR indicator if we have valid values
+        if (open && high && low && close) {
+          this.atrInstance.add(open, high, low, close)
+        }
+      }
+      
+      // Get current ATR value
+      const atrValues = this.atrInstance._values as number[]
+      if (!atrValues || atrValues.length === 0) {
+        this.logger.warn('No ATR values calculated from historical data')
+        return
+      }
+      
+      const atrValue = atrValues[atrValues.length - 1]
+      
+      if (!atrValue || isNaN(atrValue)) {
+        this.logger.warn('Invalid ATR value calculated from historical data')
+        return
+      }
+      
+      this.logger.success(`ATR initialized successfully: ${atrValue.toFixed(2)}`)
+      
+      // Update grid sizing with ATR value
+      const baseGridDistance = Math.min(
+        Math.max(
+          Math.round(atrValue * ATR_MULTIPLIER),
+          ATR_MINIMUM_GRID_DISTANCE
+        ),
+        ATR_MAXIMUM_GRID_DISTANCE
+      )
+      
+      this.gridSizing.lastATRValue = atrValue
+      this.gridSizing.currentDistance = baseGridDistance
+      this.gridSizing.upwardGridSpacing = baseGridDistance
+      this.gridSizing.downwardGridSpacing = baseGridDistance
+      this.gridSizing.lastRecalculation = Date.now()
+      
+      this.logger.info(`Initial grid distance set to ${baseGridDistance.toFixed(2)} based on ATR ${atrValue.toFixed(2)}`)
+      
+      // Also initialize trend analyzer with the same candle data
+      this.trendAnalyzer.processCandleHistory(candles)
+      
+      // Get trend analysis results
+      const trendAnalysis = this.trendAnalyzer.analyzeTrend()
+      this.logger.info(`Initial trend analysis: ${trendAnalysis.direction} (strength: ${trendAnalysis.strength.toFixed(2)})`)
+      
+      // Update grid spacing based on trend
+      this.updateGridSizingFromTrend(trendAnalysis)
+      
+      // Update breakout detector with current ATR value
+      this.breakoutDetector.updateAtrValue(atrValue)
+    } catch (error) {
+      this.logger.error(`Error initializing ATR with historical data: ${(error as Error).message}`)
+      this.logger.warn('Falling back to default ATR initialization')
     }
   }
 
@@ -505,6 +685,21 @@ export class LiveOrderManager {
       // Log order creation
       this.logger.success(`Created ${side} order: ${size} BTC @ $${roundedPrice} [${order.bitmexOrderId}]`);
       
+      // Record order creation metrics
+      if (this.metricsManager) {
+        try {
+          this.metricsManager.recordOrderCreation(
+            order.id,
+            order.side,
+            order.price,
+            order.size,
+            order.oppositeOrderPrice
+          );
+        } catch (error) {
+          this.logger.error(`Failed to record order creation metrics: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      
       return order;
     } catch (error) {
       this.logger.error(`Failed to create ${side} order at ${roundedPrice}: ${error}`);
@@ -516,6 +711,12 @@ export class LiveOrderManager {
    * Fill an order (either by simulation or by detecting real fill)
    */
   async fillOrder(order: Order, executionPrice: number): Promise<void> {
+    // Ensure execution price is valid and positive
+    if (!executionPrice || executionPrice <= 0) {
+      this.logger.error(`Invalid execution price ${executionPrice} for order #${order.id}, using order price ${order.price} instead`);
+      executionPrice = order.price; // Fallback to the order's original price
+    }
+    
     // Ensure execution price is rounded to the instrument's tick size
     executionPrice = this.roundPriceToTickSize(executionPrice);
     
@@ -528,24 +729,6 @@ export class LiveOrderManager {
     
     this.logger.success(`Order #${order.id} FILLED: ${order.side.toUpperCase()} ${order.size} BTC${contractQtyStr} @ $${executionPrice.toFixed(2)}`);
     
-    // If metrics are enabled, record the order execution
-    if (this.metricsManager) {
-      this.metricsManager.recordOrderExecution(
-        order.id,
-        order.side,
-        executionPrice,
-        order.size,
-        order.fee
-      );
-      
-      // Record trading volume
-      this.metricsManager.recordVolume(
-        order.size,
-        executionPrice * order.size,
-        order.side
-      );
-    }
-    
     // Use asymmetric grid spacing based on the order side
     // For buy fills, we place a sell, so use upward spacing
     // For sell fills, we place a buy, so use downward spacing
@@ -557,19 +740,22 @@ export class LiveOrderManager {
       ? executionPrice + gridSpacing  // For buy fills, place sell gridSpacing above execution
       : executionPrice - gridSpacing; // For sell fills, place buy gridSpacing below execution
     
+    // Ensure the new price is always positive
+    const validatedPrice = Math.max(this.roundPriceToTickSize(newPrice), this.instrumentInfo?.tickSize || 0.5);
+    
     // Check if there's any existing unfilled order at or very close to this price
     const existingOrderAtPrice = this.activeOrders.find(o => 
       !o.filled && 
-      Math.abs(o.price - newPrice) < (gridSpacing * 0.01) // Within 1% of gridSpacing
+      Math.abs(o.price - validatedPrice) < (gridSpacing * 0.01) // Within 1% of gridSpacing
     );
     
     // Always place a new order, but log if there's already one nearby
     if (existingOrderAtPrice && ENFORCE_ORDER_DISTANCE) {
-      this.logger.warn(`Placing new order at ${newPrice.toFixed(2)} despite nearby order (ID: ${existingOrderAtPrice.id}) - ENFORCE_ORDER_DISTANCE is ${ENFORCE_ORDER_DISTANCE}`);
+      this.logger.warn(`Placing new order at ${validatedPrice.toFixed(2)} despite nearby order (ID: ${existingOrderAtPrice.id}) - ENFORCE_ORDER_DISTANCE is ${ENFORCE_ORDER_DISTANCE}`);
     }
     
     // Create a new order in the opposite direction
-    const newOrder = await this.createOrder(newPrice, order.size, newSide, null);
+    const newOrder = await this.createOrder(validatedPrice, order.size, newSide, null);
     
     // For sell orders created after buy fills, set the entry price and link orders
     if (newSide === 'sell') {
@@ -578,7 +764,12 @@ export class LiveOrderManager {
       order.exitOrderId = newOrder.id; // Link entry to its exit
     }
     
-    this.logger.info(`Placed opposing ${newSide.toUpperCase()} order #${newOrder.id} at $${newPrice.toFixed(2)} (${gridSpacing.toFixed(2)} ${order.side === 'buy' ? 'above' : 'below'} fill price)`);
+    // Log if price was adjusted due to validation
+    if (validatedPrice !== newPrice) {
+      this.logger.warn(`Price adjusted from ${newPrice.toFixed(2)} to ${validatedPrice.toFixed(2)} to prevent negative price`);
+    }
+    
+    this.logger.info(`Placed opposing ${newSide.toUpperCase()} order #${newOrder.id} at $${validatedPrice.toFixed(2)} (${gridSpacing.toFixed(2)} ${order.side === 'buy' ? 'above' : 'below'} fill price)`);
     
     // Determine if this order is potentially an exit order completing a round-trip trade
     // Buy orders can be exits for previous sells, and sells can be exits for previous buys
@@ -709,6 +900,21 @@ export class LiveOrderManager {
       }
     }
     
+    // Record individual order execution metrics
+    if (this.metricsManager) {
+      try {
+        this.metricsManager.recordOrderExecution(
+          order.id,
+          order.side,
+          executionPrice,
+          order.size,
+          order.fee
+        );
+      } catch (error) {
+        this.logger.error(`Failed to record order execution metrics: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    
     // Remove the filled order from the active orders array
     this.activeOrders = this.activeOrders.filter(o => o.id !== order.id);
     this.logger.setActiveOrders(this.activeOrders.length);
@@ -733,6 +939,12 @@ export class LiveOrderManager {
     if (this._isInitializingGrid) {
       this.logger.warn('Grid initialization already in progress, ignoring duplicate call');
       return;
+    }
+
+    // Always use the current market price to center the grid
+    if (this.currentMarketPrice > 0) {
+      midPrice = this.currentMarketPrice;
+      this.logger.info(`Centering grid around current market price: ${midPrice.toFixed(2)}`);
     }
 
     this._isInitializingGrid = true;
@@ -776,20 +988,29 @@ export class LiveOrderManager {
       const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
       const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
       
+      // Ensure grid spacing is not too large relative to current price (max 2% of price)
+      const maxAllowedSpacing = Math.max(this.referencePrice * 0.02, ATR_MINIMUM_GRID_DISTANCE);
+      const adjustedUpwardGridSpacing = Math.min(upwardGridSpacing, maxAllowedSpacing);
+      const adjustedDownwardGridSpacing = Math.min(downwardGridSpacing, maxAllowedSpacing);
+      
+      if (adjustedUpwardGridSpacing !== upwardGridSpacing || adjustedDownwardGridSpacing !== downwardGridSpacing) {
+        this.logger.warn(`Grid spacing was adjusted to prevent orders too far from price: up ${upwardGridSpacing.toFixed(2)} → ${adjustedUpwardGridSpacing.toFixed(2)}, down ${downwardGridSpacing.toFixed(2)} → ${adjustedDownwardGridSpacing.toFixed(2)}`);
+      }
+      
       // Calculate grid boundaries with safety minimum
-      this.gridLowerBound = Math.max(1, this.referencePrice - (downwardGridSpacing * ORDER_COUNT));
-      this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
+      this.gridLowerBound = Math.max(1, this.referencePrice - (adjustedDownwardGridSpacing * ORDER_COUNT));
+      this.gridUpperBound = this.referencePrice + (adjustedUpwardGridSpacing * ORDER_COUNT);
       
       // Log grid initialization with asymmetric spacing if applicable
-      if (upwardGridSpacing !== downwardGridSpacing) {
-        this.logger.star(`Initializing ASYMMETRIC grid at $${this.referencePrice.toFixed(2)}, UP spacing: $${upwardGridSpacing.toFixed(2)}, DOWN spacing: $${downwardGridSpacing.toFixed(2)}`);
+      if (adjustedUpwardGridSpacing !== adjustedDownwardGridSpacing) {
+        this.logger.star(`Initializing ASYMMETRIC grid at $${this.referencePrice.toFixed(2)}, UP spacing: $${adjustedUpwardGridSpacing.toFixed(2)}, DOWN spacing: $${adjustedDownwardGridSpacing.toFixed(2)}`);
         
         // Log trend information if available
         if (this.gridSizing.trendDirection) {
           this.logger.info(`Grid spacing asymmetry based on ${this.gridSizing.trendDirection} trend (strength: ${(this.gridSizing.trendStrength || 0).toFixed(2)})`);
         }
       } else {
-        this.logger.star(`Initializing SYMMETRIC grid at $${this.referencePrice.toFixed(2)}, grid spacing: $${upwardGridSpacing.toFixed(2)}`);
+        this.logger.star(`Initializing SYMMETRIC grid at $${this.referencePrice.toFixed(2)}, grid spacing: $${adjustedUpwardGridSpacing.toFixed(2)}`);
       }
       
       if (this.gridSizing.useATR && this.gridSizing.lastATRValue > 0) {
@@ -799,7 +1020,7 @@ export class LiveOrderManager {
       // Create buy orders below the mid price with asymmetric spacing
       let currentBuyPrice = this.referencePrice;
       for (let i = 1; i <= ORDER_COUNT; i++) {
-        currentBuyPrice -= downwardGridSpacing;
+        currentBuyPrice -= adjustedDownwardGridSpacing;
         
         // Ensure we don't create buy orders with negative or very low prices
         if (currentBuyPrice <= 0) {
@@ -824,7 +1045,7 @@ export class LiveOrderManager {
       // Create sell orders above the mid price with asymmetric spacing
       let currentSellPrice = this.referencePrice;
       for (let i = 1; i <= ORDER_COUNT; i++) {
-        currentSellPrice += upwardGridSpacing;
+        currentSellPrice += adjustedUpwardGridSpacing;
         // Round the sell price to the instrument's tick size
         const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
@@ -925,42 +1146,71 @@ export class LiveOrderManager {
    * Process market trades
    */
   processTrade(trade: BitMEXTrade): void {
-    // Update current market price
-    this.currentMarketPrice = trade.price;
-    
-    // Calculate distance to closest grid order
-    let closestDistance = Number.MAX_VALUE;
-    
-    if (this.activeOrders.length > 0) {
-      closestDistance = Math.min(
-        ...this.activeOrders.map(order => Math.abs(order.price - trade.price))
-      );
+    if (!trade) {
+      return;
     }
-    
-    // Basic trade info with closest order distance
-    this.logger.debug(`MARKET TRADE: ${trade.side} ${trade.size} @ $${trade.price} (${closestDistance.toFixed(2)} from closest grid order)`);
-    
-    const currentTime = Date.now();
-    const timeSinceLastInit = currentTime - this.lastGridInitTimestamp;
 
-    // Check if price has moved significantly from reference price
-    if (this.gridInitialized && this.referencePrice > 0 && 
-        Math.abs(trade.price - this.referencePrice) > ORDER_DISTANCE * ORDER_COUNT &&
-        timeSinceLastInit > this.GRID_INIT_THROTTLE_MS) {
-      this.logger.warn(`Price moved significantly from reference: $${this.referencePrice.toFixed(2)} -> $${trade.price.toFixed(2)}`);
-      this.logger.warn(`Re-initializing grid at new price level`);
-      this.lastGridInitTimestamp = currentTime;
-      this.initializeGrid(trade.price);
+    // Update current market price first to ensure latest price is used in all operations
+    if (trade.price && trade.price > 0) {
+      this.currentMarketPrice = trade.price;
     }
-    
-    // Initialize grid if not already initialized and not too soon after the last initialization
-    if (!this.gridInitialized && timeSinceLastInit > this.GRID_INIT_THROTTLE_MS) {
-      this.lastGridInitTimestamp = currentTime;
-      this.initializeGrid(trade.price);
-    } else {
-      // In dry run mode, check if any of our orders would be filled by this trade
-      if (this.isDryRun) {
-        this.checkOrderFills(trade);
+
+    // Check if we should initialize grid if not already done
+    // Only initialize if we're not in a breakout trade
+    if (!this.gridInitialized && !this.breakoutState.active && trade.price > 0) {
+      // Use the most recent market price for grid initialization
+      this.initializeGrid(this.currentMarketPrice)
+        .catch((error) => {
+          this.logger.error(`Failed to initialize grid: ${(error as Error).message}`);
+        });
+    }
+
+    // Check if any orders were filled by this trade (skip during active breakout)
+    if (!this.breakoutState.active) {
+      this.checkOrderFills(trade);
+    }
+
+    // Add the trade data to the ATR indicator for volatility calculation
+    if (this.atrInstance && trade.price > 0) {
+      this.atrInstance.add(trade.price, trade.price, trade.price, trade.price);
+    }
+
+    // Update candles
+    if (trade.timestamp) {
+      const minute = Math.floor(trade.timestamp / (1000 * 60));
+      const lastCandleMinute = this.candles.length > 0 
+        ? Math.floor(this.candles[this.candles.length - 1].timestamp / (1000 * 60))
+        : -1;
+      
+      if (minute > lastCandleMinute && lastCandleMinute !== -1) {
+        // New minute, create a new candle
+        this.candles.push({
+          timestamp: minute * 60 * 1000,
+          open: trade.price,
+          high: trade.price,
+          low: trade.price,
+          close: trade.price,
+          volume: trade.size || 0
+        });
+        
+        // Limit the number of candles to 100
+        if (this.candles.length > 100) {
+          this.candles.shift();
+        }
+        
+        // Check for breakouts on every new candle
+        if (BREAKOUT_DETECTION_ENABLED && this.candles.length >= 5) {
+          this.checkForBreakouts().catch((error: Error) => {
+            this.logger.error(`Error checking for breakouts: ${error.message}`);
+          });
+        }
+      } else if (minute === lastCandleMinute) {
+        // Update the current candle
+        const currentCandle = this.candles[this.candles.length - 1];
+        currentCandle.high = Math.max(currentCandle.high, trade.price);
+        currentCandle.low = Math.min(currentCandle.low, trade.price);
+        currentCandle.close = trade.price;
+        currentCandle.volume += trade.size || 0; // Accumulate volume
       }
     }
   }
@@ -969,6 +1219,12 @@ export class LiveOrderManager {
    * Handle real fill notification from BitMEX
    */
   async handleOrderFill(orderID: string, executionPrice: number, side: string, orderQty: number): Promise<void> {
+    // Ensure execution price is valid and positive
+    if (!executionPrice || executionPrice <= 0) {
+      this.logger.error(`Invalid execution price ${executionPrice} for order ${orderID}, cannot process fill`);
+      return;
+    }
+    
     // Ensure execution price is rounded to the instrument's tick size
     executionPrice = this.roundPriceToTickSize(executionPrice);
     
@@ -1057,16 +1313,26 @@ export class LiveOrderManager {
    * Start periodic sync with exchange orders
    */
   private startPeriodicSync(): void {
-    // Use the constant for sync interval
-    this.logger.info(`Starting periodic order sync every ${ORDER_SYNC_INTERVAL/1000} seconds`);
+    const SYNC_INTERVAL_MS = 60000; // 1 minute
+    
+    if (this.syncIntervalId) {
+      clearInterval(this.syncIntervalId);
+    }
     
     this.syncIntervalId = setInterval(async () => {
-      this.logger.debug('Running periodic order sync with exchange');
-      await this.syncWithExchangeOrders();
-      
-      // Check and fill grid gaps after syncing with exchange
-      await this.checkAndFillGridGaps();
-    }, ORDER_SYNC_INTERVAL);
+      try {
+        await this.syncWithExchangeOrders();
+        
+        // Also check for grid gaps during this periodic sync
+        if (this.gridInitialized) {
+          await this.checkAndFillGridGaps();
+        }
+      } catch (error) {
+        this.logger.error(`Periodic sync failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }, SYNC_INTERVAL_MS);
+    
+    this.logger.info(`Started periodic sync every ${SYNC_INTERVAL_MS / 1000} seconds`);
   }
   
   /**
@@ -1314,28 +1580,34 @@ export class LiveOrderManager {
    * Clean up resources when shutting down
    */
   public cleanup(): void {
-    // Stop the sync interval
-    if (this.syncIntervalId) {
-      clearInterval(this.syncIntervalId);
-      this.syncIntervalId = null;
-    }
+    this.logger.info('Cleaning up LiveOrderManager resources')
     
-    // Stop the ATR recalculation interval
-    this.stopATRRecalculationInterval();
+    // Stop periodic sync
+    this.stopPeriodicSync()
     
-    // Stop the auto grid shift check
-    this.stopAutoGridShiftCheck();
+    // Stop ATR recalculation interval
+    this.stopATRRecalculationInterval()
     
-    // Save final state
+    // Stop auto grid shift check
+    this.stopAutoGridShiftCheck()
+    
+    // Stop breakout check interval
+    this.stopBreakoutCheckInterval()
+    
+    // Save complete state
     if (this.stateManager) {
-      this.stateManager.updateActiveOrders(this.activeOrders);
-      this.stateManager.updateCompletedTrades(this.completedTrades);
-      this.stateManager.updateReferencePrice(this.referencePrice);
-      this.stateManager.updateGridSizing(this.gridSizing);
-      this.stateManager.saveState();
+      this.stateManager.saveState({
+        activeOrders: this.activeOrders,
+        completedTrades: this.completedTrades,
+        gridInitialized: this.gridInitialized,
+        referencePrice: this.referencePrice,
+        gridSizing: this.gridSizing,
+        breakoutState: this.breakoutState,
+        completedBreakoutTrades: this.completedBreakoutTrades
+      })
     }
     
-    this.logger.info('LiveOrderManager cleanup complete - all intervals stopped');
+    this.logger.success('LiveOrderManager cleanup complete')
   }
 
   /**
@@ -1361,7 +1633,8 @@ export class LiveOrderManager {
     }
     
     for (const trade of trades) {
-      const { timestamp, price } = trade;
+      const { timestamp, price, size } = trade;
+      const tradeSize = size || 0; // Use 0 if size is not available
       const mts = new Date(timestamp).getTime();
       
       if (candleMTS === 0 || (mts - candleMTS > candleSizeMS)) {
@@ -1376,51 +1649,21 @@ export class LiveOrderManager {
           high: price,
           low: price,
           close: price,
-          timestamp: mts
+          timestamp: mts,
+          volume: tradeSize
         };
       } else if (currentCandle) {
         // Update current candle
         currentCandle.high = Math.max(currentCandle.high, price);
         currentCandle.low = Math.min(currentCandle.low, price);
         currentCandle.close = price;
+        currentCandle.volume += tradeSize; // Accumulate volume
       }
     }
     
-    // Add final candle
+    // Add the last candle if it exists
     if (currentCandle) {
       candles.push(currentCandle);
-    }
-    
-    // Log candle statistics
-    if (candles.length > 0) {
-      const firstCandle = candles[0];
-      const lastCandle = candles[candles.length - 1];
-      const timeDiffMinutes = (lastCandle.timestamp - firstCandle.timestamp) / (1000 * 60);
-      
-      this.logger.info(`Created ${candles.length} candles spanning ${timeDiffMinutes.toFixed(0)} minutes`);
-      this.logger.debug(`First candle: ${new Date(firstCandle.timestamp).toISOString()}, O: ${firstCandle.open}, H: ${firstCandle.high}, L: ${firstCandle.low}, C: ${firstCandle.close}`);
-      this.logger.debug(`Last candle: ${new Date(lastCandle.timestamp).toISOString()}, O: ${lastCandle.open}, H: ${lastCandle.high}, L: ${lastCandle.low}, C: ${lastCandle.close}`);
-      
-      // Check for price variation
-      let hasVariation = false;
-      let lowestPrice = candles[0].low;
-      let highestPrice = candles[0].high;
-      
-      for (const candle of candles) {
-        lowestPrice = Math.min(lowestPrice, candle.low);
-        highestPrice = Math.max(highestPrice, candle.high);
-        
-        if (candle.high !== candle.low) {
-          hasVariation = true;
-        }
-      }
-      
-      const priceRange = highestPrice - lowestPrice;
-      this.logger.info(`Price range in candles: ${lowestPrice} to ${highestPrice} (range: ${priceRange})`);
-      
-      if (!hasVariation) {
-        this.logger.warn('Warning: No price variation detected in candles (all OHLC values identical)');
-      }
     }
     
     return candles;
@@ -1637,17 +1880,36 @@ export class LiveOrderManager {
    * Start ATR recalculation interval
    */
   startATRRecalculationInterval(): void {
-    this.logger.info(`Starting ATR recalculation every ${ATR_RECALCULATION_INTERVAL/1000/60} minutes`);
-    
-    this.atrRecalculationIntervalId = setInterval(async () => {
-      this.logger.debug('Running scheduled ATR recalculation');
-      await this.calculateATRAndUpdateGridSpacing();
-      
-      // If grid is active, log current grid metrics
-      if (this.gridInitialized) {
-        this.logger.info(`Current grid: ${this.activeOrders.length} orders, spacing: ${this.gridSizing.currentDistance}, ATR: ${this.gridSizing.lastATRValue.toFixed(2)}`);
+    if (this.atrRecalculationIntervalId !== null) {
+      clearInterval(this.atrRecalculationIntervalId);
+    }
+
+    this.atrRecalculationIntervalId = setInterval(() => {
+      try {
+        // Recalculate ATR and update grid spacing
+        this.calculateATRAndUpdateGridSpacing()
+          .then(() => {
+            // Only check for grid gaps if we're not in a breakout trade
+            if (!this.breakoutState.active) {
+              return this.checkAndFillGridGaps();
+            }
+          })
+          .catch((error: Error) => {
+            this.logger.error(`Error in ATR recalculation interval: ${error.message}`);
+          });
+          
+        // Check for breakouts if enabled and not already in a breakout
+        if (BREAKOUT_DETECTION_ENABLED && !this.breakoutState.active && this.candles.length >= 5) {
+          this.checkForBreakouts().catch((error: Error) => {
+            this.logger.error(`Error checking for breakouts: ${error.message}`);
+          });
+        }
+      } catch (error) {
+        this.logger.error(`Error in ATR recalculation interval: ${(error as Error).message}`);
       }
     }, ATR_RECALCULATION_INTERVAL);
+
+    this.logger.info(`ATR recalculation interval started (every ${ATR_RECALCULATION_INTERVAL / 1000} seconds)`);
   }
   
   /**
@@ -1843,22 +2105,21 @@ export class LiveOrderManager {
     const currentPrice = this.currentMarketPrice;
     
     // Calculate grid boundaries with threshold
-    const effectiveLowerBound = this.gridLowerBound + (this.gridLowerBound * GRID_SHIFT_THRESHOLD);
-    const effectiveUpperBound = this.gridUpperBound - (this.gridUpperBound * GRID_SHIFT_THRESHOLD);
+    const effectiveLowerBound = this.gridLowerBound + ((this.gridUpperBound - this.gridLowerBound) * GRID_SHIFT_THRESHOLD);
+    const effectiveUpperBound = this.gridUpperBound - ((this.gridUpperBound - this.gridLowerBound) * GRID_SHIFT_THRESHOLD);
     
-    let shiftDirection: 'up' | 'down' | null = null;
-    
-    // Check if price is below the lower threshold or above the upper threshold
-    if (currentPrice < effectiveLowerBound) {
-      shiftDirection = 'down';
-    } else if (currentPrice > effectiveUpperBound) {
-      shiftDirection = 'up';
-    }
-    
-    if (shiftDirection) {
-      this.logger.star(`Market price (${currentPrice.toFixed(2)}) has moved ${shiftDirection === 'up' ? 'above' : 'below'} the grid boundary`);
-      this.logger.info(`Current grid range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
-      await this.shiftGrid(shiftDirection);
+    // Check if price is outside the effective grid bounds
+    if (currentPrice < effectiveLowerBound || currentPrice > effectiveUpperBound) {
+      // Calculate how far the price is from the center of the grid as a percentage
+      const gridCenter = (this.gridLowerBound + this.gridUpperBound) / 2;
+      const distanceFromCenter = Math.abs(currentPrice - gridCenter) / gridCenter;
+      
+      this.logger.star(`Market price (${currentPrice.toFixed(2)}) has moved outside effective grid boundaries`);
+      this.logger.info(`Current grid range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}, effective range: ${effectiveLowerBound.toFixed(2)} - ${effectiveUpperBound.toFixed(2)}`);
+      this.logger.info(`Price is ${(distanceFromCenter * 100).toFixed(2)}% away from grid center`);
+      
+      // Shift grid to center around current price
+      await this.shiftGrid(currentPrice > gridCenter ? 'up' : 'down');
     }
   }
 
@@ -1877,26 +2138,11 @@ export class LiveOrderManager {
     const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
     const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
     
-    // Calculate new reference price
-    let newReferencePrice: number;
+    // Calculate new reference price - CENTER AROUND CURRENT MARKET PRICE
+    const currentPrice = this.currentMarketPrice;
+    let newReferencePrice = currentPrice;
     
-    if (direction === 'up') {
-      // Calculate the new reference price by shifting up
-      // We shift up by a percentage of the current grid size
-      const gridSize = this.gridUpperBound - this.referencePrice;
-      const shiftAmount = gridSize * (1 - GRID_SHIFT_OVERLAP);
-      newReferencePrice = this.referencePrice + shiftAmount;
-      
-      this.logger.info(`Shifting grid UP by ${shiftAmount.toFixed(2)} from ${this.referencePrice.toFixed(2)} to ${newReferencePrice.toFixed(2)}`);
-    } else {
-      // Calculate the new reference price by shifting down
-      // We shift down by a percentage of the current grid size
-      const gridSize = this.referencePrice - this.gridLowerBound;
-      const shiftAmount = gridSize * (1 - GRID_SHIFT_OVERLAP);
-      newReferencePrice = this.referencePrice - shiftAmount;
-      
-      this.logger.info(`Shifting grid DOWN by ${shiftAmount.toFixed(2)} from ${this.referencePrice.toFixed(2)} to ${newReferencePrice.toFixed(2)}`);
-    }
+    this.logger.info(`Shifting grid to center around current market price: ${currentPrice.toFixed(2)}`);
     
     // Sort orders by price
     const buyOrders = this.activeOrders
@@ -1907,32 +2153,9 @@ export class LiveOrderManager {
       .filter(order => order.side === 'sell' && !order.filled)
       .sort((a, b) => a.price - b.price); // Sort by price ascending
     
-    // Determine orders to keep and orders to cancel
-    const ordersToCancel: Order[] = [];
+    // Cancel all existing orders since we're centering the grid
+    const ordersToCancel = [...this.activeOrders.filter(order => !order.filled)];
     
-    if (direction === 'up') {
-      // When shifting up, we cancel lower buy orders and keep upper ones
-      const keepCount = Math.floor(buyOrders.length * GRID_SHIFT_OVERLAP);
-      const cancelCount = buyOrders.length - keepCount;
-      
-      if (cancelCount > 0 && buyOrders.length > 0) {
-        // Cancel lowest buy orders
-        ordersToCancel.push(...buyOrders.slice(keepCount));
-        this.logger.info(`Will cancel ${cancelCount} lowest buy orders and create new sell orders`);
-      }
-    } else {
-      // When shifting down, we cancel higher sell orders and keep lower ones
-      const keepCount = Math.floor(sellOrders.length * GRID_SHIFT_OVERLAP);
-      const cancelCount = sellOrders.length - keepCount;
-      
-      if (cancelCount > 0 && sellOrders.length > 0) {
-        // Cancel highest sell orders
-        ordersToCancel.push(...sellOrders.slice(keepCount));
-        this.logger.info(`Will cancel ${cancelCount} highest sell orders and create new buy orders`);
-      }
-    }
-    
-    // Cancel orders that are no longer needed
     if (ordersToCancel.length > 0) {
       for (const order of ordersToCancel) {
         try {
@@ -1944,6 +2167,21 @@ export class LiveOrderManager {
           this.activeOrders = this.activeOrders.filter(o => o.id !== order.id);
           
           this.logger.success(`Cancelled ${order.side} order at ${order.price} as part of grid shift`);
+          
+          // Record cancellation metrics
+          if (this.metricsManager) {
+            try {
+              this.metricsManager.recordOrderCancellation(
+                order.id,
+                order.side,
+                order.price,
+                order.size,
+                'grid_shift'
+              );
+            } catch (error) {
+              this.logger.error(`Failed to record order cancellation metrics: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
         } catch (error) {
           this.logger.error(`Failed to cancel order as part of grid shift: ${error}`);
         }
@@ -1955,51 +2193,54 @@ export class LiveOrderManager {
     this.gridLowerBound = this.referencePrice - (downwardGridSpacing * ORDER_COUNT);
     this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
     
-    // Create new orders in the shifted grid area
-    if (direction === 'up') {
-      // Create new sell orders above the current ones
-      const highestSellPrice = sellOrders.length > 0 ? sellOrders[sellOrders.length - 1].price : this.referencePrice;
-      let currentSellPrice = highestSellPrice;
+    // Create new grid orders centered around the current price
+    // Create buy orders below the mid price
+    let currentBuyPrice = this.referencePrice;
+    for (let i = 1; i <= ORDER_COUNT; i++) {
+      currentBuyPrice -= downwardGridSpacing;
       
-      for (let i = 0; i < ordersToCancel.length; i++) {
-        currentSellPrice += upwardGridSpacing;
-        const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
-        
-        try {
-          const order = await this.createOrder(roundedSellPrice, BASE_ORDER_SIZE, 'sell', null);
-          order.entryPrice = this.referencePrice;
-          order.isEntryOrder = true; // These are new entry orders (not matched to buys)
-          this.logger.success(`Created new sell order at ${roundedSellPrice} as part of grid shift`);
-          
-          // Brief delay to avoid rate limits
-          if (i < ordersToCancel.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 200));
-          }
-        } catch (error) {
-          this.logger.error(`Failed to create sell order at ${roundedSellPrice}: ${error}`);
-        }
+      // Ensure we don't create buy orders with negative or very low prices
+      if (currentBuyPrice <= 0) {
+        this.logger.warn(`Skipping buy order at negative price point: ${currentBuyPrice}`);
+        continue;
       }
-    } else {
-      // Create new buy orders below the current ones
-      const lowestBuyPrice = buyOrders.length > 0 ? buyOrders[buyOrders.length - 1].price : this.referencePrice;
-      let currentBuyPrice = lowestBuyPrice;
       
-      for (let i = 0; i < ordersToCancel.length; i++) {
-        currentBuyPrice -= downwardGridSpacing;
-        const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
+      const roundedBuyPrice = this.roundPriceToTickSize(currentBuyPrice);
+      
+      // Additional safety check
+      if (roundedBuyPrice <= 0) {
+        this.logger.warn(`Skipping buy order at invalid price point after rounding: ${roundedBuyPrice}`);
+        continue;
+      }
+      
+      try {
+        const order = await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
+        order.isEntryOrder = true; // New buy orders are entry orders
+        this.logger.success(`Created new buy order at ${roundedBuyPrice} as part of grid shift`);
         
-        try {
-          const order = await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
-          order.isEntryOrder = true; // New buy orders are entry orders
-          this.logger.success(`Created new buy order at ${roundedBuyPrice} as part of grid shift`);
-          
-          // Brief delay to avoid rate limits
-          if (i < ordersToCancel.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 200));
-          }
-        } catch (error) {
-          this.logger.error(`Failed to create buy order at ${roundedBuyPrice}: ${error}`);
-        }
+        // Brief delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (error) {
+        this.logger.error(`Failed to create buy order at ${roundedBuyPrice}: ${error}`);
+      }
+    }
+    
+    // Create sell orders above the mid price
+    let currentSellPrice = this.referencePrice;
+    for (let i = 1; i <= ORDER_COUNT; i++) {
+      currentSellPrice += upwardGridSpacing;
+      const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
+      
+      try {
+        const order = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
+        order.entryPrice = this.referencePrice;
+        order.isEntryOrder = true; // These are new entry orders
+        this.logger.success(`Created new sell order at ${roundedSellPrice} as part of grid shift`);
+        
+        // Brief delay to avoid rate limits
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (error) {
+        this.logger.error(`Failed to create sell order at ${roundedSellPrice}: ${error}`);
       }
     }
     
@@ -2013,7 +2254,7 @@ export class LiveOrderManager {
       this.metricsManager.recordGridDistance(upwardGridSpacing);
     }
     
-    this.logger.star(`Grid successfully shifted ${direction.toUpperCase()}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+    this.logger.star(`Grid successfully centered around current price ${this.currentMarketPrice.toFixed(2)}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
   }
 
   /**
@@ -2073,5 +2314,395 @@ export class LiveOrderManager {
     
     // No matching entry found
     return null;
+  }
+
+  private async checkForBreakouts(): Promise<void> {
+    if (!BREAKOUT_DETECTION_ENABLED || this.candles.length < 5) {
+      return
+    }
+
+    // Skip if we're already in a breakout trade
+    if (this.breakoutState.active) {
+      await this.manageActiveBreakout()
+      return
+    }
+
+    // Skip if we're in cooldown period
+    const now = Date.now()
+    if (this.breakoutState.lastBreakoutEndTimestamp > 0 && 
+        now - this.breakoutState.lastBreakoutEndTimestamp < BREAKOUT_COOLDOWN_MINUTES * 60 * 1000) {
+      return
+    }
+
+    // Update ATR value in breakout detector
+    const currentAtrValue = this.getGridDistance()
+    this.breakoutDetector.updateAtrValue(currentAtrValue)
+
+    // Check for breakouts
+    const breakoutResult = this.breakoutDetector.detectBreakout(this.candles)
+    
+    if (breakoutResult.detected && breakoutResult.direction !== null) {
+      await this.enterBreakoutTrade(breakoutResult.direction, breakoutResult.atrValue)
+    }
+  }
+
+  private async enterBreakoutTrade(direction: BreakoutDirection, atrValue: number): Promise<void> {
+    if (direction === null) {
+      return
+    }
+
+    // Calculate the current market price to use for entry
+    const { currentMarketPrice } = this
+    if (!currentMarketPrice) {
+      this.logger.warn('Cannot enter breakout trade: current market price is unknown')
+      return
+    }
+
+    // Calculate position size (larger than normal grid orders)
+    const baseSize = ORDER_SIZE * BREAKOUT_POSITION_SIZE_MULTIPLIER
+    const positionSize = this.calculatePositionSizeSafely(baseSize, direction)
+    
+    if (positionSize <= 0) {
+      this.logger.warn(`Cannot enter breakout trade: calculated position size is ${positionSize}`)
+      return
+    }
+
+    // Calculate profit target and stop loss based on ATR
+    const profitTargetDistance = atrValue * BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE
+    const stopLossDistance = atrValue * BREAKOUT_STOP_LOSS_ATR_MULTIPLE
+    
+    const profitTargetPrice = direction === 'up' 
+      ? currentMarketPrice + profitTargetDistance
+      : currentMarketPrice - profitTargetDistance
+      
+    const stopLossPrice = direction === 'up'
+      ? currentMarketPrice - stopLossDistance
+      : currentMarketPrice + stopLossDistance
+
+    try {
+      // Convert to order side ('buy' or 'sell')
+      const orderSide = direction === 'up' ? 'buy' : 'sell'
+      
+      // Pause the grid trading by canceling all active orders
+      this.logger.star(`BREAKOUT DETECTED - Pausing grid trading and entering ${direction.toUpperCase()} directional trade`)
+      await this.cancelAllOrders()
+      
+      // Place the breakout order
+      const order = await this.createOrder(
+        currentMarketPrice, 
+        positionSize, 
+        orderSide, 
+        null
+      )
+      
+      // Update breakout state
+      const now = Date.now()
+      this.breakoutState = {
+        active: true,
+        direction,
+        entryPrice: currentMarketPrice,
+        profitTargetPrice,
+        stopLossPrice,
+        entryTimestamp: now,
+        timeoutTimestamp: now + (BREAKOUT_TIMEOUT_MINUTES * 60 * 1000),
+        positionSize,
+        orderIds: [order.id.toString()], // Convert to string
+        lastBreakoutEndTimestamp: this.breakoutState.lastBreakoutEndTimestamp
+      }
+      
+      // Log the breakout trade details
+      this.logger.star(`BREAKOUT TRADE ENTERED: ${direction.toUpperCase()} | Entry: $${currentMarketPrice.toFixed(2)} | Target: $${profitTargetPrice.toFixed(2)} | Stop: $${stopLossPrice.toFixed(2)} | Size: ${positionSize.toFixed(6)} BTC`)
+      
+      // Start checking the breakout status regularly
+      this.startBreakoutCheckInterval()
+    } catch (error) {
+      this.logger.error(`Failed to enter breakout trade: ${(error as Error).message}`)
+    }
+  }
+
+  private async manageActiveBreakout(): Promise<void> {
+    if (!this.breakoutState.active || this.breakoutState.direction === null) {
+      return
+    }
+
+    const { currentMarketPrice } = this
+    if (!currentMarketPrice) {
+      return
+    }
+
+    const { 
+      direction, 
+      entryPrice, 
+      profitTargetPrice, 
+      stopLossPrice, 
+      timeoutTimestamp 
+    } = this.breakoutState
+    
+    const now = Date.now()
+    let exitReason: 'take_profit' | 'stop_loss' | 'timeout' | 'manual' | null = null
+    
+    // Check if profit target hit
+    if ((direction === 'up' && currentMarketPrice >= profitTargetPrice) || 
+        (direction === 'down' && currentMarketPrice <= profitTargetPrice)) {
+      exitReason = 'take_profit'
+    }
+    
+    // Check if stop loss hit
+    if ((direction === 'up' && currentMarketPrice <= stopLossPrice) || 
+        (direction === 'down' && currentMarketPrice >= stopLossPrice)) {
+      exitReason = 'stop_loss'
+    }
+    
+    // Check if timeout reached
+    if (now >= timeoutTimestamp) {
+      exitReason = 'timeout'
+    }
+    
+    // Exit the breakout trade if any exit condition met
+    if (exitReason) {
+      await this.exitBreakoutTrade(currentMarketPrice, exitReason)
+    }
+  }
+
+  private async exitBreakoutTrade(exitPrice: number, reason: 'take_profit' | 'stop_loss' | 'timeout' | 'manual'): Promise<void> {
+    if (!this.breakoutState.active || this.breakoutState.direction === null) {
+      return;
+    }
+
+    // Record the result
+    const profit = this.breakoutState.direction === 'up' 
+      ? exitPrice - this.breakoutState.entryPrice
+      : this.breakoutState.entryPrice - exitPrice;
+    
+    const profitPercent = profit / this.breakoutState.entryPrice * 100;
+    const durationMs = Date.now() - this.breakoutState.entryTimestamp;
+    
+    // Format result for logging
+    const resultEmoji = profit > 0 ? '💰' : '❌';
+    const directionFormat = this.breakoutState.direction === 'up' ? 'LONG' : 'SHORT';
+    const profitText = profit > 0 
+      ? `+$${profit.toFixed(2)} (+${profitPercent.toFixed(2)}%)` 
+      : `-$${Math.abs(profit).toFixed(2)} (${profitPercent.toFixed(2)}%)`;
+    
+    this.logger.star(`${resultEmoji} EXITED ${directionFormat} BREAKOUT TRADE: ${profitText} | Reason: ${reason.toUpperCase()}`);
+    
+    // Save the result to history
+    const tradeResult: BreakoutTradeResult = {
+      direction: this.breakoutState.direction,
+      entryPrice: this.breakoutState.entryPrice,
+      exitPrice,
+      positionSize: this.breakoutState.positionSize,
+      profit,
+      duration: durationMs,
+      exitReason: reason
+    };
+    
+    this.completedBreakoutTrades.push(tradeResult);
+    
+    // Save to state
+    this.stateManager.saveState({
+      completedBreakoutTrades: this.completedBreakoutTrades
+    });
+    
+    // Record metrics if available
+    if (this.metricsManager) {
+      // Use recordTrade method instead of recordMetric
+      this.metricsManager.recordTrade(
+        profit,
+        0, // No fees for breakout trades in this implementation
+        this.breakoutState.positionSize,
+        this.breakoutState.entryPrice,
+        exitPrice
+      );
+    }
+    
+    // Reset breakout state
+    this.breakoutState = {
+      active: false,
+      direction: null,
+      entryPrice: 0,
+      profitTargetPrice: 0,
+      stopLossPrice: 0,
+      entryTimestamp: 0,
+      timeoutTimestamp: 0,
+      positionSize: 0,
+      orderIds: [],
+      lastBreakoutEndTimestamp: Date.now() // Set cooldown period
+    };
+    
+    // Update state
+    this.stateManager.saveState({
+      breakoutState: this.breakoutState
+    });
+    
+    // Re-initialize grid with current market price to ensure proper placement
+    // This helps avoid the problem of grid being placed too far from price
+    if (this.currentMarketPrice > 0) {
+      this.logger.info(`Re-initializing grid trading at current market price: $${this.currentMarketPrice.toFixed(2)}`);
+      // Wait a short time for any open orders to settle
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 1000));
+      await this.initializeGrid(this.currentMarketPrice);
+    } else {
+      this.logger.warn('Cannot re-initialize grid after breakout: current market price is unavailable');
+    }
+  }
+
+  private startBreakoutCheckInterval(): void {
+    if (this.breakoutCheckIntervalId !== null) {
+      clearInterval(this.breakoutCheckIntervalId)
+    }
+    
+    // Check breakout status every 5 seconds
+    this.breakoutCheckIntervalId = setInterval(() => {
+      this.manageActiveBreakout().catch((error: Error) => {
+        this.logger.error(`Error in breakout check interval: ${error.message}`)
+      })
+    }, 5000)
+  }
+  
+  private stopBreakoutCheckInterval(): void {
+    if (this.breakoutCheckIntervalId !== null) {
+      clearInterval(this.breakoutCheckIntervalId)
+      this.breakoutCheckIntervalId = null
+    }
+  }
+
+  private calculatePositionSizeSafely(desiredSize: number, direction: 'up' | 'down'): number {
+    // Convert direction to order side
+    const side = direction === 'up' ? 'buy' : 'sell'
+    
+    // Check if this would exceed position limits
+    this.wouldExceedPositionLimit(desiredSize, side)
+      .then((wouldExceed) => {
+        if (wouldExceed) {
+          // If it would exceed, reduce the size by half
+          return desiredSize / 2
+        }
+        return desiredSize
+      })
+      .catch((error) => {
+        this.logger.error(`Error checking position limits: ${error.message}`)
+        // Be conservative on error
+        return desiredSize / 2
+      })
+    
+    return desiredSize
+  }
+
+  public isInBreakoutMode(): boolean {
+    return this.breakoutState.active
+  }
+  
+  public getBreakoutState(): BreakoutState {
+    return { ...this.breakoutState }
+  }
+  
+  public getCompletedBreakoutTrades(): BreakoutTradeResult[] {
+    return [...this.completedBreakoutTrades]
+  }
+  
+  public async cancelBreakoutManually(): Promise<void> {
+    if (this.breakoutState.active) {
+      await this.exitBreakoutTrade(this.currentMarketPrice, 'manual')
+    }
+  }
+
+  // Add this method to cancel all orders
+  private async cancelAllOrders(): Promise<void> {
+    try {
+      if (this.isDryRun) {
+        // In dry run mode, just clear the active orders array
+        this.logger.info('DRY RUN: Simulating cancellation of all active orders')
+        this.activeOrders = []
+        return
+      }
+
+      // In live mode, cancel orders through the API
+      this.logger.info(`Cancelling all ${this.activeOrders.length} active orders`)
+      await this.api.cancelAllOrders(this.symbol)
+      
+      // Record metrics for each cancelled order
+      if (this.metricsManager) {
+        for (const order of this.activeOrders) {
+          try {
+            this.metricsManager.recordOrderCancellation(
+              order.id,
+              order.side,
+              order.price,
+              order.size,
+              'bulk_cancel'
+            );
+          } catch (error) {
+            this.logger.error(`Failed to record order cancellation metrics: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+      
+      // Clear the local active orders array
+      this.activeOrders = []
+    } catch (error) {
+      this.logger.error(`Failed to cancel all orders: ${(error as Error).message}`)
+      throw error
+    }
+  }
+
+  /**
+   * Start periodic order stats reporting
+   */
+  private startOrderStatsReporting(): void {
+    if (!this.metricsManager) return;
+    
+    const ORDER_STATS_INTERVAL_MS = 30000; // 30 seconds
+    
+    // Track order counts for metrics
+    let createdOrdersCount = 0;
+    let filledOrdersCount = 0;
+    let cancelledOrdersCount = 0;
+    
+    // Create a listener for order creation
+    const originalCreateOrder = this.createOrder.bind(this);
+    this.createOrder = async (price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> => {
+      const order = await originalCreateOrder(price, size, side, oppositeOrderPrice);
+      createdOrdersCount++;
+      return order;
+    };
+    
+    // Start the interval
+    setInterval(() => {
+      try {
+        // Calculate active order stats
+        const activeBuyOrders = this.activeOrders.filter(o => o.side === 'buy' && !o.filled).length;
+        const activeSellOrders = this.activeOrders.filter(o => o.side === 'sell' && !o.filled).length;
+        
+        // Record stats
+        this.metricsManager?.recordOrderStats(
+          this.activeOrders.filter(o => !o.filled).length,
+          activeBuyOrders,
+          activeSellOrders,
+          createdOrdersCount,
+          filledOrdersCount,
+          cancelledOrdersCount
+        );
+      } catch (error) {
+        this.logger.error(`Failed to record order stats: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }, ORDER_STATS_INTERVAL_MS);
+    
+    // Monitor fill and cancellation events
+    const originalFillOrder = this.fillOrder.bind(this);
+    this.fillOrder = async (order: Order, executionPrice: number): Promise<void> => {
+      await originalFillOrder(order, executionPrice);
+      filledOrdersCount++;
+    };
+    
+    // Add a hook to count cancellations in cancelAllOrders
+    const originalCancelAll = this.cancelAllOrders.bind(this);
+    this.cancelAllOrders = async (): Promise<void> => {
+      const cancelCount = this.activeOrders.filter(o => !o.filled).length;
+      await originalCancelAll();
+      cancelledOrdersCount += cancelCount;
+    };
+    
+    this.logger.info(`Started order stats reporting every ${ORDER_STATS_INTERVAL_MS / 1000} seconds`);
   }
 } 

@@ -303,7 +303,8 @@ export class TrendAnalyzer {
         open: price,
         high: price + Math.random() * 50,
         low: price - Math.random() * 50,
-        close: price
+        close: price,
+        volume: Math.random() * 1000 // Add random volume
       };
     });
     

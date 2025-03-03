@@ -200,7 +200,7 @@ export class LiveWebSocket {
           // If it was already processed via execution event, the order manager will handle the duplicate
           this.orderManager.handleOrderFill(
             order.orderID,
-            order.price,
+            order.avgPx || order.price, // Use avgPx (average execution price) if available, otherwise use the order price
             order.side,
             order.orderQty
           );

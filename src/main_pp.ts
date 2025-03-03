@@ -14,7 +14,11 @@ import {
   MAX_ORDER_SIZE_MULTIPLIER, 
   MIN_ORDER_SIZE_MULTIPLIER,
   ORDER_DISTANCE,
-  ORDER_SIZE
+  ORDER_SIZE,
+  BREAKOUT_DETECTION_ENABLED,
+  BREAKOUT_ATR_THRESHOLD,
+  BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
+  BREAKOUT_STOP_LOSS_ATR_MULTIPLE
 } from './constants';
 
 // Load environment variables
@@ -78,6 +82,13 @@ const run = async (): Promise<void> => {
       logger.info(`Order size range: ${MIN_ORDER_SIZE_MULTIPLIER.toFixed(2)}x - ${MAX_ORDER_SIZE_MULTIPLIER.toFixed(2)}x across ${ORDER_SIZE_PRICE_RANGE_FACTOR.toFixed(2)}x grid range`);
     } else {
       logger.info('Variable Order Size: DISABLED - All orders will use the same size');
+    }
+    
+    if (BREAKOUT_DETECTION_ENABLED) {
+      logger.star('Breakout Detection: ENABLED - Grid trading will pause during strong breakouts');
+      logger.info(`Breakout settings: ATR Threshold: ${BREAKOUT_ATR_THRESHOLD}x, Profit Target: ${BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE}x ATR, Stop Loss: ${BREAKOUT_STOP_LOSS_ATR_MULTIPLE}x ATR`);
+    } else {
+      logger.info('Breakout Detection: DISABLED - Grid trading will continue during all market conditions');
     }
     
     if (DRY_RUN) {

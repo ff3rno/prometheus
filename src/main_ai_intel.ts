@@ -259,6 +259,7 @@ async function main(symbol: string) {
       low: number;
       close: number;
       timestamp: number;
+      volume: number;
     }
     
     const candles: Candle[] = [];
@@ -280,7 +281,8 @@ async function main(symbol: string) {
           high: price,
           low: price,
           close: price,
-          timestamp: mts
+          timestamp: mts,
+          volume: trade.size || 0
         };
         
         bb.add(price);
@@ -292,6 +294,7 @@ async function main(symbol: string) {
           currentCandle.high = Math.max(currentCandle.high, price);
           currentCandle.low = Math.min(currentCandle.low, price);
           currentCandle.close = price;
+          currentCandle.volume += trade.size || 0;
 
          // atr.update(currentCandle);
         }

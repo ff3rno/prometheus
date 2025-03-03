@@ -3,6 +3,7 @@ import { JSONFile } from 'lowdb/node';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Order, CompletedTrade, GridSizingConfig } from './types';
+import { BreakoutState, BreakoutTradeResult } from './types/breakout';
 import { StatsLogger } from './logger';
 
 // Define the database schema
@@ -19,6 +20,9 @@ interface AppState {
   lastUpdated: string;
   sessionStartTime: string;
   gridSizing?: GridSizingConfig;
+  gridInitialized?: boolean;
+  breakoutState?: BreakoutState;
+  completedBreakoutTrades?: BreakoutTradeResult[];
 }
 
 export class StateManager {
@@ -102,15 +106,24 @@ export class StateManager {
   /**
    * Save the current state to disk
    */
-  async saveState(): Promise<void> {
+  async saveState(state?: Partial<AppState>): Promise<void> {
     try {
-      if (this.db.data) {
-        this.db.data.lastUpdated = new Date().toISOString();
-        await this.db.write();
-        this.logger.debug(`State saved to ${this.savePath}`);
+      if (!this.db.data) {
+        this.logger.error('Database data is null, cannot save state')
+        return
       }
+      
+      if (state) {
+        // Update with provided state properties
+        this.db.data = { ...this.db.data, ...state }
+      }
+      
+      // Always update timestamp
+      this.db.data.lastUpdated = new Date().toISOString()
+      await this.db.write()
+      this.logger.debug(`State saved to ${this.savePath}`)
     } catch (error) {
-      this.logger.error(`Failed to save state: ${error}`);
+      this.logger.error(`Error saving state: ${error}`)
     }
   }
   
