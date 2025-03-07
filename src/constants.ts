@@ -6,6 +6,8 @@ export const ORDER_COUNT = 4 // Number of orders on each side
 export const ORDER_DISTANCE = 40 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
 export const ORDER_SIZE = 0.001 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
 
+export const POSITION_PROFIT_CLOSE_THRESHOLD = 12 // Maximum unrealised PNL to close a position
+
 // Safety measures
 export const MAX_POSITION_SIZE_BTC = 0.1 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 10 // Maximum number of open orders allowed

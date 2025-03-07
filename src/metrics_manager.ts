@@ -121,6 +121,33 @@ export class MetricsManager {
       });
   }
 
+  public recordPositionClosedInProfit(unrealisedPnl: number, currentQty: number, avgEntryPrice: number, exitPrice: number): void {
+    if (!this.enabled || !this.client) {
+      this.logger.debug(`Metrics: Not recording position close - enabled: ${this.enabled}, client: ${!!this.client}`);
+      return;
+    }
+
+    try {
+      const point = Point.measurement('position_close')
+        .setTag('instrument', this.tradingPair)
+        .setField('unrealised_pnl', unrealisedPnl)
+        .setField('current_qty', currentQty)
+        .setField('avg_entry_price', avgEntryPrice)
+        .setField('exit_price', exitPrice)
+        .setTimestamp(new Date());
+
+      const lineProtocol = point.toLineProtocol();
+      if (lineProtocol) {
+        this.logger.info(`Attempting to record position close metric: unrealised_pnl=${unrealisedPnl}, current_qty=${currentQty}, avg_entry_price=${avgEntryPrice}, exit_price=${exitPrice}`);
+        this.writeData(lineProtocol, `position close ${unrealisedPnl.toFixed(4)} USD`);
+      } else {
+        this.logger.error('Failed to generate line protocol for position close metric');
+      }
+    } catch (error) {
+      this.logger.error(`Error creating metrics for position close: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   /**
    * Record a completed round-trip trade with profit/loss
    */

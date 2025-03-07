@@ -38,7 +38,8 @@ import {
   BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
   BREAKOUT_TIMEOUT_MINUTES,
   BREAKOUT_POSITION_SIZE_MULTIPLIER,
-  BREAKOUT_COOLDOWN_MINUTES
+  BREAKOUT_COOLDOWN_MINUTES,
+  POSITION_PROFIT_CLOSE_THRESHOLD
 } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
@@ -75,6 +76,7 @@ export class LiveOrderManager {
   };
   private completedBreakoutTrades: BreakoutTradeResult[] = [];
   private breakoutCheckIntervalId: NodeJS.Timeout | null = null;
+  private positionCloseCheckIntervalId: NodeJS.Timeout | null = null;
   private gridSizing: GridSizingConfig = {
     useATR: true,
     currentDistance: ORDER_DISTANCE,
@@ -200,6 +202,8 @@ export class LiveOrderManager {
       
       // Start periodic sync
       this.startPeriodicSync()
+
+      this.startPositionCloseCheckInterval()
       
       // Start order stats reporting if metrics manager is available
       if (this.metricsManager) {
@@ -1656,6 +1660,8 @@ export class LiveOrderManager {
     
     // Stop breakout check interval
     this.stopBreakoutCheckInterval()
+
+    this.stopPositionCloseCheckInterval()
     
     // Save complete state
     if (this.stateManager) {
@@ -2971,5 +2977,48 @@ export class LiveOrderManager {
       unrealisedPnl: 0,
       isOpen: false
     };
+  }
+
+  private startPositionCloseCheckInterval(): void {
+    if (this.positionCloseCheckIntervalId !== null) {
+      clearInterval(this.positionCloseCheckIntervalId)
+    }
+    
+    this.positionCloseCheckIntervalId = setInterval(() => {
+      this.checkAndCloseProfitablePosition().catch((error: Error) => {
+        this.logger.error(`Error in position close check interval: ${error.message}`)
+      })
+    }, 5000)
+  }
+  
+  private stopPositionCloseCheckInterval(): void {
+    if (this.positionCloseCheckIntervalId !== null) {
+      clearInterval(this.positionCloseCheckIntervalId)
+      this.positionCloseCheckIntervalId = null
+    }
+  }
+
+  private async checkAndCloseProfitablePosition(): Promise<void> {
+    const position = await this.api.getPosition(this.symbol);
+
+    if (position && typeof position.unrealisedPnl !== 'undefined' && position.unrealisedPnl > POSITION_PROFIT_CLOSE_THRESHOLD) {
+      this.logger.info(`Closing profitable position with PNL: ${position.unrealisedPnl}`);
+
+      await this.api.placeLimitOrder(
+        position.currentQty > 0 ? 'Sell' : 'Buy',
+        this.currentMarketPrice,
+        Math.abs(position.currentQty),
+        this.symbol
+      );
+
+      if (this.metricsManager) {
+        this.metricsManager.recordPositionClosedInProfit(
+          position.unrealisedPnl,
+          position.currentQty,
+          position.avgEntryPrice ?? 0,
+          this.currentMarketPrice
+        );
+      }
+    }
   }
 } 
