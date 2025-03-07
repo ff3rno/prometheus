@@ -39,7 +39,7 @@ import {
   BREAKOUT_TIMEOUT_MINUTES,
   BREAKOUT_POSITION_SIZE_MULTIPLIER,
   BREAKOUT_COOLDOWN_MINUTES,
-  POSITION_PROFIT_CLOSE_THRESHOLD
+  POSITION_ROE_CLOSE_THRESHOLD
 } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
@@ -3001,21 +3001,29 @@ export class LiveOrderManager {
   private async checkAndCloseProfitablePosition(): Promise<void> {
     const position = await this.api.getPosition(this.symbol);
 
-    if (position && typeof position.unrealisedPnl !== 'undefined' && position.unrealisedPnl > POSITION_PROFIT_CLOSE_THRESHOLD) {
-      this.logger.info(`Closing profitable position with PNL: ${position.unrealisedPnl}`);
+    if (!position) {
+      return
+    }
+
+    const { symbol, currentQty, unrealisedRoePcnt, avgEntryPrice } = position;
+
+    this.logger.info(`position symbol=${symbol} currentQty=${currentQty} unrealisedRoePcnt=${unrealisedRoePcnt} avgEntryPrice=${avgEntryPrice}`)
+
+    if (unrealisedRoePcnt !== undefined && unrealisedRoePcnt > POSITION_ROE_CLOSE_THRESHOLD) {
+      this.logger.info(`Closing profitable position with ROE: ${unrealisedRoePcnt}`);
 
       await this.api.placeLimitOrder(
-        position.currentQty > 0 ? 'Sell' : 'Buy',
+        currentQty > 0 ? 'Sell' : 'Buy',
         this.currentMarketPrice,
-        Math.abs(position.currentQty),
+        Math.abs(currentQty) / this.currentMarketPrice,
         this.symbol
       );
 
       if (this.metricsManager) {
         this.metricsManager.recordPositionClosedInProfit(
-          position.unrealisedPnl,
-          position.currentQty,
-          position.avgEntryPrice ?? 0,
+          unrealisedRoePcnt,
+          currentQty,
+          avgEntryPrice ?? 0,
           this.currentMarketPrice
         );
       }
