@@ -9,7 +9,7 @@ export const ORDER_SIZE = 0.003 // Size of each order in BTC (for FFWCSX instrum
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.2 // Maximum unrealised ROE to close a position
 
 // Safety measures
-export const MAX_POSITION_SIZE_BTC = 0.14 // Maximum allowed position size in BTC
+export const MAX_POSITION_SIZE_BTC = 0.018 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 8 // Maximum number of open orders allowed
 
 // ATR parameters for dynamic grid sizing
