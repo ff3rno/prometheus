@@ -25,7 +25,7 @@ export const ATR_HISTORICAL_TRADES_LOOKBACK = 90 // How many minutes to look bac
 export const INFINITY_GRID_ENABLED = true // Enable infinity grid features
 export const GRID_SHIFT_THRESHOLD = 0.2 // Shift grid when price moves beyond this fraction of the grid range
 export const GRID_SHIFT_OVERLAP = 0.5 // Fraction of orders to keep when shifting the grid
-export const GRID_AUTO_SHIFT_CHECK_INTERVAL = 20000 // Check for grid shift every 20 seconds
+export const GRID_AUTO_SHIFT_CHECK_INTERVAL = 60000 // Check for grid shift every 60 seconds
 
 // Variable order size parameters
 export const VARIABLE_ORDER_SIZE_ENABLED = true // Enable variable order sizes
