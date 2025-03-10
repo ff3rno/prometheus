@@ -3,8 +3,8 @@ export const BITMEX_WS_API_URL = 'wss://ws.bitmex.com/realtime'
 
 // Market making parameters
 export const ORDER_COUNT = 3 // Number of orders on each side
-export const ORDER_DISTANCE = 95 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
-export const ORDER_SIZE = 0.01 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
+export const ORDER_DISTANCE = 90 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
+export const ORDER_SIZE = 0.003 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
 
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.2 // Maximum unrealised ROE to close a position
 
@@ -15,7 +15,7 @@ export const MAX_OPEN_ORDERS = 8 // Maximum number of open orders allowed
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation
 export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing
-export const ATR_MINIMUM_GRID_DISTANCE = 95 // Minimum grid distance in USD (increased for safety)
+export const ATR_MINIMUM_GRID_DISTANCE = 90 // Minimum grid distance in USD (increased for safety)
 export const ATR_MAXIMUM_GRID_DISTANCE = 120 // Maximum grid distance in USD (increased for higher price volatility)
 export const GAP_DETECTION_TOLERANCE = 2.0 // Multiplier for grid distance to identify gaps (higher = less sensitive)
 export const ATR_RECALCULATION_INTERVAL =  1000 * 60 * 15 // Recalculate ATR
