@@ -6,13 +6,13 @@ export const DEFAULT_SYMBOL = 'XBTUSD'
 // Market making parameters
 export const ORDER_COUNT = 3 // Number of orders on each side
 export const ORDER_DISTANCE = 70 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
-export const ORDER_SIZE = 0.005 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
+export const ORDER_SIZE = 0.002 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
 export const BREAKEVEN_GRID_ENABLED = true // Enable grid spacing based on fee calculation for breakeven trading
 
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.02 // Maximum unrealised ROE to close a position
 
 // Safety measures
-export const MAX_POSITION_SIZE_BTC = 0.01 // Maximum allowed position size in BTC
+export const MAX_POSITION_SIZE_BTC = 0.008 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 8 // Maximum number of open orders allowed
 
 // ATR parameters for dynamic grid sizing
