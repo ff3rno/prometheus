@@ -18,7 +18,8 @@ import {
   BREAKOUT_DETECTION_ENABLED,
   BREAKOUT_ATR_THRESHOLD,
   BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
-  BREAKOUT_STOP_LOSS_ATR_MULTIPLE
+  BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
+  DEFAULT_SYMBOL
 } from './constants';
 
 // Load environment variables
@@ -27,7 +28,7 @@ dotenv.config();
 // Extract API credentials
 const API_KEY = process.env.BITMEX_API_KEY || '';
 const API_SECRET = process.env.BITMEX_API_SECRET || '';
-const SYMBOL = process.env.TRADING_SYMBOL || 'XBTUSD';
+const SYMBOL = process.env.TRADING_SYMBOL || DEFAULT_SYMBOL;
 const DRY_RUN = process.env.DRY_RUN === 'true' || !API_KEY || !API_SECRET;
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 

@@ -1011,16 +1011,12 @@ export class LiveOrderManager {
       return;
     }
 
-    // Always use the current market price to center the grid initially
-    // This will establish our static reference price
-    if (this.currentMarketPrice > 0) {
-      midPrice = this.currentMarketPrice;
-      this.logger.info(`Setting static reference price at current market price: ${midPrice.toFixed(2)}`);
-    }
-
     this._isInitializingGrid = true;
 
     try {
+      // Store existing orders before clearing for size reference
+      const existingOrders = [...this.activeOrders];
+
       // If running in live mode, sync with exchange and cancel any existing orders first
       if (!this.isDryRun) {
         try {
@@ -1091,6 +1087,14 @@ export class LiveOrderManager {
         this.logger.info(`Using ATR-based grid sizing: ATR=${this.gridSizing.lastATRValue.toFixed(2)}, multiplier=${ATR_MULTIPLIER}`);
       }
 
+      // Helper function to find existing order at a similar price level
+      const findExistingOrderAtPrice = (price: number, side: 'buy' | 'sell'): Order | undefined => {
+        return existingOrders.find(order => 
+          order.side === side && 
+          Math.abs(order.price - price) < (this.instrumentInfo?.tickSize || 0.5)
+        );
+      };
+
       // Create buy orders below the mid price with asymmetric spacing
       let currentBuyPrice = this.referencePrice;
       for (let i = 1; i <= ORDER_COUNT; i++) {
@@ -1111,8 +1115,12 @@ export class LiveOrderManager {
           continue;
         }
 
+        // Check for existing order at this price level and use its size if found
+        const existingOrder = findExistingOrderAtPrice(roundedBuyPrice, 'buy');
+        const orderSize = existingOrder ? existingOrder.size : ORDER_SIZE;
+
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-        const buyOrder = await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
+        const buyOrder = await this.createOrder(roundedBuyPrice, orderSize, 'buy', null);
         buyOrder.isEntryOrder = true; // Buy orders are entries
       }
 
@@ -1122,8 +1130,13 @@ export class LiveOrderManager {
         currentSellPrice += adjustedUpwardGridSpacing;
         // Round the sell price to the instrument's tick size
         const roundedSellPrice = this.roundPriceToTickSize(currentSellPrice);
+
+        // Check for existing order at this price level and use its size if found
+        const existingOrder = findExistingOrderAtPrice(roundedSellPrice, 'sell');
+        const orderSize = existingOrder ? existingOrder.size : ORDER_SIZE;
+
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
-        const sellOrder = await this.createOrder(roundedSellPrice, ORDER_SIZE, 'sell', null);
+        const sellOrder = await this.createOrder(roundedSellPrice, orderSize, 'sell', null);
         // For sell orders, set the entry price to the current mid price
         // This allows tracking profit when the sell order is filled and later a buy order completes the cycle
         sellOrder.entryPrice = this.referencePrice;
@@ -3023,7 +3036,7 @@ export class LiveOrderManager {
 
     this.logger.info(`position symbol=${symbol} currentQty=${currentQty} unrealisedRoePcnt=${unrealisedRoePcnt} avgEntryPrice=${avgEntryPrice}`)
 
-    if (unrealisedRoePcnt !== undefined && unrealisedRoePcnt > POSITION_ROE_CLOSE_THRESHOLD) {
+    if (unrealisedRoePcnt !== undefined && Math.abs(unrealisedRoePcnt) > POSITION_ROE_CLOSE_THRESHOLD) {
       this.logger.info(`Closing profitable position with ROE: ${unrealisedRoePcnt}`);
 
       await this.api.placeLimitOrder(
