@@ -19,7 +19,8 @@ import {
   BREAKOUT_ATR_THRESHOLD,
   BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
   BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
-  DEFAULT_SYMBOL
+  DEFAULT_SYMBOL,
+  BREAKEVEN_GRID_ENABLED
 } from './constants';
 
 // Load environment variables
@@ -90,6 +91,12 @@ const run = async (): Promise<void> => {
       logger.info(`Breakout settings: ATR Threshold: ${BREAKOUT_ATR_THRESHOLD}x, Profit Target: ${BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE}x ATR, Stop Loss: ${BREAKOUT_STOP_LOSS_ATR_MULTIPLE}x ATR`);
     } else {
       logger.info('Breakout Detection: DISABLED - Grid trading will continue during all market conditions');
+    }
+    
+    if (BREAKEVEN_GRID_ENABLED) {
+      logger.star('Breakeven Grid Mode: ENABLED - Grid spacing will adapt to ensure breakeven trades after fees');
+    } else {
+      logger.info(`Breakeven Grid Mode: DISABLED - Using fixed grid spacing of ${ORDER_DISTANCE}`);
     }
     
     if (DRY_RUN) {

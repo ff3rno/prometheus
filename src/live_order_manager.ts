@@ -39,7 +39,8 @@ import {
   BREAKOUT_TIMEOUT_MINUTES,
   BREAKOUT_POSITION_SIZE_MULTIPLIER,
   BREAKOUT_COOLDOWN_MINUTES,
-  POSITION_ROE_CLOSE_THRESHOLD
+  POSITION_ROE_CLOSE_THRESHOLD,
+  BREAKEVEN_GRID_ENABLED
 } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
@@ -758,6 +759,12 @@ export class LiveOrderManager {
     const newSide = order.side === 'buy' ? 'sell' : 'buy';
     const gridSpacing = this.getAsymmetricGridDistance(newSide, executionPrice);
 
+    // If breakeven grid is enabled, log the calculated breakeven distance
+    if (BREAKEVEN_GRID_ENABLED) {
+      const breakEvenDistance = this.calculateBreakevenGridDistance(executionPrice);
+      this.logger.info(`Using breakeven grid distance of ${breakEvenDistance.toFixed(2)} at price ${executionPrice.toFixed(2)} to cover ${FEE_RATE}% fees`);
+    }
+
     // Calculate a new appropriate price based on the execution price and asymmetric spacing
     const newPrice = order.side === 'buy'
       ? executionPrice + gridSpacing  // For buy fills, place sell gridSpacing above execution
@@ -1057,6 +1064,12 @@ export class LiveOrderManager {
       // Get upward and downward grid spacing
       const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
       const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+
+      // If breakeven grid is enabled, log the calculated distance
+      if (BREAKEVEN_GRID_ENABLED) {
+        const breakEvenDistance = this.calculateBreakevenGridDistance(this.referencePrice);
+        this.logger.star(`BREAKEVEN GRID MODE ENABLED - Using minimum distance of ${breakEvenDistance.toFixed(2)} at ${this.referencePrice.toFixed(2)} to cover ${FEE_RATE}% fees`);
+      }
 
       // Ensure grid spacing is not too large relative to current price (max 2% of price)
       const maxAllowedSpacing = Math.max(this.referencePrice * 0.02, ATR_MINIMUM_GRID_DISTANCE);
@@ -2018,9 +2031,32 @@ export class LiveOrderManager {
   }
 
   /**
-   * Get current grid distance based on ATR or constant
+   * Calculate the minimum grid distance required for breakeven trading based on fee rate
+   * @param price The current price level
+   * @returns The minimum grid distance for breakeven trading
+   */
+  private calculateBreakevenGridDistance(price: number): number {
+    // Formula: breakeven distance = (2 * price * feeRate) / (1 - feeRate)
+    // This accounts for fees on both entry and exit trades
+    const feeRateDecimal = FEE_RATE / 100;
+    const minimumDistance = (2 * price * feeRateDecimal) / (1 - feeRateDecimal);
+    
+    // Round up to the nearest tick size
+    return this.roundPriceToTickSize(Math.ceil(minimumDistance));
+  }
+
+  /**
+   * Get current grid distance based on ATR, constant, or breakeven calculation
    */
   getGridDistance(): number {
+    // If breakeven grid is enabled, calculate the minimum distance based on current market price
+    if (BREAKEVEN_GRID_ENABLED) {
+      const baseDistance = this.calculateBreakevenGridDistance(this.currentMarketPrice);
+      this.logger.debug(`Using breakeven grid distance: ${baseDistance.toFixed(2)} at price ${this.currentMarketPrice.toFixed(2)}`);
+      return baseDistance;
+    }
+    
+    // Otherwise use ATR or constant distance
     return this.gridSizing.useATR ? this.gridSizing.currentDistance : ORDER_DISTANCE;
   }
 
@@ -2030,6 +2066,13 @@ export class LiveOrderManager {
    * @param currentPrice The current market price
    */
   getAsymmetricGridDistance(side: 'buy' | 'sell', currentPrice: number): number {
+    // If breakeven grid is enabled, calculate the minimum distance based on the provided price
+    if (BREAKEVEN_GRID_ENABLED) {
+      const breakEvenDistance = this.calculateBreakevenGridDistance(currentPrice);
+      this.logger.debug(`Using breakeven asymmetric grid distance: ${breakEvenDistance.toFixed(2)} at price ${currentPrice.toFixed(2)}`);
+      return breakEvenDistance;
+    }
+    
     if (!this.gridSizing.useATR) {
       return ORDER_DISTANCE;
     }

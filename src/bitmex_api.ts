@@ -4,11 +4,12 @@ import { URL } from 'url';
 import Bottleneck from 'bottleneck';
 import { Order, BitMEXOrder, BitMEXPosition, BitMEXInstrument } from './types';
 import { StatsLogger } from './logger';
+import { HistoryLogger } from './history_logger';
 
 export class BitMEXAPI {
   private apiKey: string;
   private apiSecret: string;
-  private logger: StatsLogger;
+  private logger: StatsLogger | HistoryLogger;
   private testnet: boolean;
   private baseUrl: string;
   private instrumentCache: Map<string, BitMEXInstrument> = new Map();
@@ -19,7 +20,7 @@ export class BitMEXAPI {
   // Order-specific limiter: 10 requests per second
   private orderLimiter: Bottleneck;
 
-  constructor(apiKey: string, apiSecret: string, logger: StatsLogger, testnet: boolean = false) {
+  constructor(apiKey: string, apiSecret: string, logger: StatsLogger | HistoryLogger, testnet: boolean = false) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.logger = logger;
