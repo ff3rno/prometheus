@@ -12,7 +12,7 @@ export const BREAKEVEN_GRID_ENABLED = true // Enable grid spacing based on fee c
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.02 // Maximum unrealised ROE to close a position
 
 // Safety measures
-export const MAX_POSITION_SIZE_BTC = 0.04 // Maximum allowed position size in BTC
+export const MAX_POSITION_SIZE_BTC = 0.01 // Maximum allowed position size in BTC
 export const MAX_OPEN_ORDERS = 8 // Maximum number of open orders allowed
 
 // ATR parameters for dynamic grid sizing
@@ -31,7 +31,7 @@ export const GRID_SHIFT_OVERLAP = 0.5 // Fraction of orders to keep when shiftin
 export const GRID_AUTO_SHIFT_CHECK_INTERVAL = 15000 // Check for grid shift every 15 seconds
 
 // Variable order size parameters
-export const VARIABLE_ORDER_SIZE_ENABLED = true // Enable variable order sizes
+export const VARIABLE_ORDER_SIZE_ENABLED = false // Enable variable order sizes
 export const BASE_ORDER_SIZE = ORDER_SIZE // Base size for orders (same as ORDER_SIZE by default)
 export const MAX_ORDER_SIZE_MULTIPLIER = 1.8 // Maximum multiplier for order size (at lowest prices)
 export const MIN_ORDER_SIZE_MULTIPLIER = 0.8 // Minimum multiplier for order size (at highest prices)
