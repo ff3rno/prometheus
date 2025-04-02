@@ -630,7 +630,7 @@ export class LiveOrderManager {
     const roundedPrice = this.roundPriceToTickSize(price);
 
     // Apply variable order size calculation if enabled
-    const orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : size;
+    const orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : ORDER_SIZE;
 
     // Log if we're using a variable order size
     if (VARIABLE_ORDER_SIZE_ENABLED && Math.abs(orderSize - size) > 0.00001) {
@@ -785,7 +785,7 @@ export class LiveOrderManager {
     }
 
     // Create a new order in the opposite direction
-    const newOrder = await this.createOrder(validatedPrice, order.size, newSide, null);
+    const newOrder = await this.createOrder(validatedPrice, VARIABLE_ORDER_SIZE_ENABLED ? order.size : ORDER_SIZE, newSide, null);
 
     // For sell orders created after buy fills, set the entry price and link orders
     if (newSide === 'sell') {
@@ -1130,7 +1130,7 @@ export class LiveOrderManager {
 
         // Check for existing order at this price level and use its size if found
         const existingOrder = findExistingOrderAtPrice(roundedBuyPrice, 'buy');
-        const orderSize = existingOrder ? existingOrder.size : ORDER_SIZE;
+        const orderSize = VARIABLE_ORDER_SIZE_ENABLED && existingOrder ? existingOrder.size : ORDER_SIZE;
 
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
         const buyOrder = await this.createOrder(roundedBuyPrice, orderSize, 'buy', null);
@@ -1146,7 +1146,7 @@ export class LiveOrderManager {
 
         // Check for existing order at this price level and use its size if found
         const existingOrder = findExistingOrderAtPrice(roundedSellPrice, 'sell');
-        const orderSize = existingOrder ? existingOrder.size : ORDER_SIZE;
+        const orderSize = VARIABLE_ORDER_SIZE_ENABLED && existingOrder ? existingOrder.size : ORDER_SIZE;
 
         // Set oppositeOrderPrice to null since we now calculate it dynamically on fill
         const sellOrder = await this.createOrder(roundedSellPrice, orderSize, 'sell', null);
@@ -2384,7 +2384,7 @@ export class LiveOrderManager {
       }
 
       try {
-        const order = await this.createOrder(roundedBuyPrice, BASE_ORDER_SIZE, 'buy', null);
+        const order = await this.createOrder(roundedBuyPrice, ORDER_SIZE, 'buy', null);
         order.isEntryOrder = true; // New buy orders are entry orders
         this.logger.success(`Created new buy order at ${roundedBuyPrice} as part of grid shift`);
 

@@ -3,6 +3,9 @@ export const BITMEX_WS_API_URL = 'wss://ws.bitmex.com/realtime'
 
 export const DEFAULT_SYMBOL = 'XBTUSD'
 
+// BitMEX API hard limits
+export const MAX_ORDER_SIZE_CONTRACTS = 300 // Maximum order size in contracts allowed to be sent to BitMEX
+
 // Market making parameters
 export const ORDER_COUNT = 3 // Number of orders on each side
 export const ORDER_DISTANCE = 70 // Distance between each order in USD (must be positive and appropriate for the instrument price range)

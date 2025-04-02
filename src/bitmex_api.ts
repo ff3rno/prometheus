@@ -5,6 +5,7 @@ import Bottleneck from 'bottleneck';
 import { Order, BitMEXOrder, BitMEXPosition, BitMEXInstrument } from './types';
 import { StatsLogger } from './logger';
 import { HistoryLogger } from './history_logger';
+import { MAX_ORDER_SIZE_CONTRACTS } from './constants';
 
 export class BitMEXAPI {
   private apiKey: string;
@@ -399,6 +400,15 @@ export class BitMEXAPI {
       if (roundedPrice !== price) {
         this.logger.warn(`Adjusted price from ${price} to ${roundedPrice} to comply with tick size ${tickSize}`);
         price = roundedPrice;
+      }
+
+      // FINAL SAFETY CHECK: Hard limit on maximum order size in contracts
+      // This must be the last check before submitting the order
+      if (Math.abs(orderQty) > MAX_ORDER_SIZE_CONTRACTS) {
+        const originalQty = orderQty;
+        // Cap the order at the maximum size while preserving the sign
+        orderQty = Math.sign(orderQty) * MAX_ORDER_SIZE_CONTRACTS;
+        this.logger.warn(`Order size exceeded hard limit! Capping from ${originalQty} to ${orderQty} contracts (${MAX_ORDER_SIZE_CONTRACTS} max)`);
       }
 
       const orderData = {
