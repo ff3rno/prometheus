@@ -1,15 +1,14 @@
 import { Signale } from 'signale'
 
-// Create a custom logger with stats
 export class StatsLogger {
   private signale: Signale;
   private cumulativePnL: number = 0;
   private totalTrades: number = 0;
   private winningTrades: number = 0;
   private losingTrades: number = 0;
-  private cumulativeFees: number = 0; // Track total fees paid
-  private cumulativeVolume: number = 0; // Track total trading volume in BTC
-  private activeOrders: number = 0; // Track active order count
+  private cumulativeFees: number = 0;
+  private cumulativeVolume: number = 0;
+  private activeOrders: number = 0;
 
   constructor(scope: string) {
     this.signale = new Signale({ scope: `prometheus:${scope}` });
@@ -30,7 +29,6 @@ export class StatsLogger {
     } else if (profit < 0) {
       this.losingTrades++;
     }
-    // If profit is exactly 0, it's neither a win nor a loss
   }
 
   setStatus(status: string): void {
@@ -64,4 +62,4 @@ export class StatsLogger {
   warn(message: string): void {
     this.signale.warn(`${this.getStatsPrefix()} ${message}`);
   }
-} 
+}

@@ -1,10 +1,11 @@
 import axios from 'axios'
 import dotenv from 'dotenv'
-import path from 'path'
 import fs from 'fs'
-import { SlackMessagePayload, SlackResponse, SlackText, SlackBlock } from '../types/slack'
+import path from 'path'
+import { SlackMessagePayload, SlackResponse, SlackBlock } from '../types/slack'
 import { SECDocumentAnalysis } from '../types/sec_analysis'
 import { SECFiling } from '../types/sec'
+import { Database } from '../types/database'
 
 dotenv.config()
 
@@ -36,7 +37,9 @@ export const sendSlackNotification = async (
     return
   }
 
-  const fileStats = fs.statSync(filePath)
+  // Validate and normalize filePath for security
+  const normalizedPath = path.normalize(filePath)
+  const fileStats = fs.statSync(normalizedPath)
   const fileCreatedAt = new Date(fileStats.birthtime).toISOString()
 
   const headerBlock: SlackBlock = {
@@ -172,31 +175,40 @@ export const sendSlackNotification = async (
 export const sendNotificationForSavedAnalysis = async (
   filingId: string, 
   analysisFilePath: string, 
-  db: any
+  db: Database
 ): Promise<void> => {
-  if (!fs.existsSync(analysisFilePath)) {
-    console.error(`Analysis file not found: ${analysisFilePath}`)
+  // Validate and normalize path for security
+  const normalizedPath = path.normalize(analysisFilePath)
+  if (!fs.existsSync(normalizedPath)) {
+    console.error(`Analysis file not found: ${normalizedPath}`)
     return
   }
 
   try {
-    const analysis: SECDocumentAnalysis = JSON.parse(fs.readFileSync(analysisFilePath, 'utf-8'))
+    const analysisContent = fs.readFileSync(normalizedPath, 'utf-8')
+    const analysis = JSON.parse(analysisContent) as SECDocumentAnalysis
     
     if ('error' in analysis) {
-      console.error(`Cannot send notification for analysis with error: ${analysis.error}`)
+      console.error(`Cannot send notification for analysis with error: ${String(analysis.error)}`)
       return
     }
     
-    if (!db.data?.lastProcessedFilings?.[filingId]) {
+    // Check if the key exists in the database and has the correct structure
+    const lastProcessedFilings = db.data?.lastProcessedFilings
+    if (!lastProcessedFilings || typeof lastProcessedFilings !== 'object') {
+      console.error('Invalid database structure: lastProcessedFilings not found or invalid')
+      return
+    }
+    
+    const filing = lastProcessedFilings[filingId] as SECFiling | undefined
+    if (!filing) {
       console.error(`Filing data not found for ID: ${filingId}`)
       return
     }
     
-    const filing: SECFiling = db.data.lastProcessedFilings[filingId]
-    
-    await sendSlackNotification(filing, analysis, analysisFilePath)
+    await sendSlackNotification(filing, analysis, normalizedPath)
     console.log(`Sent Slack notification for filing ${filingId}`)
   } catch (error) {
-    console.error(`Failed to send notification for saved analysis: ${error}`)
+    console.error(`Failed to send notification for saved analysis: ${String(error)}`)
   }
 } 

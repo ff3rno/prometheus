@@ -340,8 +340,15 @@ export class LiveOrderManager {
    * Get instrument lot size
    */
   private getLotSize(): number {
-    // Default to 1 if we couldn't get instrument info
     return this.instrumentInfo?.lotSize || 1;
+  }
+
+  private isUSDInstrument(): boolean {
+    return this.symbol.includes('USD');
+  }
+
+  private ensureSafePrice(price: number): number {
+    return Math.max(price, 0.01);
   }
 
   /**
@@ -352,20 +359,13 @@ export class LiveOrderManager {
       return Math.round(btcSize * price);
     }
 
-    // For XBTUSD and similar "FFWCSX" instruments, convert BTC to USD contracts
-    if (this.symbol.includes('USD')) {
-      // Ensure price is positive
-      const safePrice = Math.max(price, 0.01);
-
-      // Calculate raw contract quantity (1 contract = 1 USD)
+    if (this.isUSDInstrument()) {
+      const safePrice = this.ensureSafePrice(price);
       const rawContractQty = btcSize * safePrice;
-
-      // Round to the instrument's lot size
-      const lotSize = this.instrumentInfo.lotSize;
+      const lotSize = this.getLotSize();
       return Math.round(rawContractQty / lotSize) * lotSize;
     }
 
-    // For other instrument types, just return the BTC size
     return btcSize;
   }
 
@@ -395,6 +395,11 @@ export class LiveOrderManager {
     }
 
     return tickSizeStr.length - decimalIndex - 1;
+  }
+
+  private calculateFee(price: number, size: number): number {
+    const feeRate = FEE_RATE / 100;
+    return price * size * feeRate;
   }
 
   /**
@@ -471,7 +476,7 @@ export class LiveOrderManager {
               this.logger.warn(`Order ${bitmexOrder.orderID} has contract quantity ${contractQty} that is not a multiple of lot size ${lotSize}`);
             }
 
-            const fee = bitmexOrder.price * size * (FEE_RATE / 100);
+            const fee = this.calculateFee(bitmexOrder.price, size);
 
             return {
               id: parseInt(bitmexOrder.orderID.slice(-6), 10) || getNextOrderId(),
@@ -620,56 +625,41 @@ export class LiveOrderManager {
    * Create an order and place it on the exchange
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
-    // Validate price is positive
     if (price <= 0) {
       this.logger.error(`Cannot create order with invalid price: ${price}`);
       throw new Error(`Invalid price: ${price}`);
     }
 
-    // Round price to tick size
     const roundedPrice = this.roundPriceToTickSize(price);
-
-    // Apply variable order size calculation if enabled
     const orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : ORDER_SIZE;
 
-    // Log if we're using a variable order size
     if (VARIABLE_ORDER_SIZE_ENABLED && Math.abs(orderSize - size) > 0.00001) {
       this.logger.info(`Using variable order size: ${side} @ ${roundedPrice} - adjusted from ${size.toFixed(8)} to ${orderSize.toFixed(8)} BTC`);
     }
 
-    // Check if we already have an order at this price point
-    const existingOrder = this.activeOrders.find(
-      order => !order.filled &&
-               order.side === side &&
-               Math.abs(order.price - roundedPrice) < this.instrumentInfo?.tickSize! / 2
-    );
-
-    if (existingOrder) {
+    if (this.hasExistingOrderAtPrice(roundedPrice, side)) {
       this.logger.warn(`Skipping ${side} order at ${roundedPrice} - already have an order at this price point`);
-      return existingOrder;
+      return this.activeOrders.find(
+        order => !order.filled &&
+                 order.side === side &&
+                 Math.abs(order.price - roundedPrice) < this.instrumentInfo?.tickSize! / 2
+      )!;
     }
 
-    // Check if we would exceed the maximum number of open orders
     if (this.wouldExceedOrderLimit()) {
       this.logger.warn(`Maximum open orders limit reached (${MAX_OPEN_ORDERS}). Cannot create new ${side} order at ${roundedPrice}`);
       throw new Error(`Maximum open orders limit (${MAX_OPEN_ORDERS}) reached`);
     }
 
-    // Check if we would exceed the maximum position size
     const exceedsPositionLimit = await this.wouldExceedPositionLimit(orderSize, side);
     if (exceedsPositionLimit) {
       this.logger.warn(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded. Cannot create new ${side} order at ${roundedPrice}`);
       throw new Error(`Maximum position size limit (${MAX_POSITION_SIZE_BTC} BTC) would be exceeded`);
     }
 
-    // Calculate fees - BitMEX charges fees on the value (price * quantity)
-    const feeRate = FEE_RATE / 100; // Convert from percentage to decimal
-    const fee = roundedPrice * orderSize * feeRate;
-
-    // Calculate contract quantity for BitMEX
+    const fee = this.calculateFee(roundedPrice, orderSize);
     const contractQty = this.calculateContractQty(orderSize, roundedPrice);
 
-    // Create new order object
     const order: Order = {
       id: getNextOrderId(),
       price: roundedPrice,
@@ -681,7 +671,6 @@ export class LiveOrderManager {
       filled: false
     };
 
-    // If in dry run mode, just add to local orders
     if (this.isDryRun) {
       this.activeOrders.push(order);
       this.logger.info(`[DRY RUN] Created ${side} order: ${size} BTC @ $${roundedPrice}`);
@@ -689,7 +678,6 @@ export class LiveOrderManager {
     }
 
     try {
-      // Place the order on BitMEX
       const bitmexOrder = await this.api.placeLimitOrder(
         side === 'buy' ? 'Buy' : 'Sell',
         roundedPrice,
@@ -697,19 +685,11 @@ export class LiveOrderManager {
         this.symbol
       );
 
-      // Update order with BitMEX order ID
       order.bitmexOrderId = bitmexOrder.orderID;
-
-      // Add to active orders
       this.activeOrders.push(order);
-
-      // Update state
       await this.stateManager.updateActiveOrders(this.activeOrders);
-
-      // Log order creation
       this.logger.success(`Created ${side} order: ${size} BTC @ $${roundedPrice} [${order.bitmexOrderId}]`);
 
-      // Record order creation metrics
       if (this.metricsManager) {
         try {
           this.metricsManager.recordOrderCreation(
@@ -3098,5 +3078,14 @@ export class LiveOrderManager {
         );
       }
     }
+  }
+
+  private hasExistingOrderAtPrice(price: number, side: 'buy' | 'sell'): boolean {
+    const tickSize = this.instrumentInfo?.tickSize || 0.5;
+    return this.activeOrders.some(
+      order => !order.filled &&
+               order.side === side &&
+               Math.abs(order.price - price) < tickSize / 2
+    );
   }
 }

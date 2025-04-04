@@ -15,11 +15,7 @@
     "warnOnUnsupportedTypeScriptVersion": true
   },
   "plugins": [
-    "pure",
-    "github",
-    "lodash",
     "regexp",
-    "sonarjs",
     "unicorn",
     "promise",
     "immutable",
@@ -29,14 +25,11 @@
     "optimize-regex",
     "@typescript-eslint",
     "write-good-comments",
-    "eslint-plugin-tsdoc",
+    "eslint-plugin-tsdoc"
   ],
   "extends": [
     "eslint:recommended",
-    "plugin:github/recommended",
-    "plugin:lodash/recommended",
     "plugin:regexp/recommended",
-    "plugin:sonarjs/recommended",
     "plugin:promise/recommended",
     "plugin:switch-case/recommended",
     "plugin:security/recommended-legacy",
@@ -61,7 +54,6 @@
     "@typescript-eslint/no-unsafe-call": 0,
     "sonarjs/no-nested-template-literals": 0,
     "@typescript-eslint/no-explicit-any": 0,
-    "filenames/match-regex": [2, "^[a-z_]+$", true],
     "@typescript-eslint/no-unsafe-assignment": 0
   }
 }

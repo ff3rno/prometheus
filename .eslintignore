@@ -1,6 +1,0 @@
-**/node_modules
-/docs
-/dist
-src/declarations.d.ts
-.eslintrc.json
-commitlint.config.ts

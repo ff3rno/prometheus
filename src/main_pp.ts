@@ -23,32 +23,26 @@ import {
   BREAKEVEN_GRID_ENABLED
 } from './constants';
 
-// Load environment variables
 dotenv.config();
 
-// Extract API credentials
 const API_KEY = process.env.BITMEX_API_KEY || '';
 const API_SECRET = process.env.BITMEX_API_SECRET || '';
 const SYMBOL = process.env.TRADING_SYMBOL || DEFAULT_SYMBOL;
 const DRY_RUN = process.env.DRY_RUN === 'true' || !API_KEY || !API_SECRET;
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 
-// InfluxDB configuration
 const INFLUX_HOST = process.env.INFLUX_HOST || '';
 const INFLUX_TOKEN = process.env.INFLUX_TOKEN || '';
 const INFLUX_DATABASE = process.env.INFLUX_DATABASE || 'prometheus_grid';
 const INFLUX_ENABLED = process.env.INFLUX_ENABLED === 'true' && !!INFLUX_HOST;
 const INFLUX_DEBUG = process.env.INFLUX_DEBUG === 'true';
 
-// Create a logger instance
 const logger = new StatsLogger('pp-live');
 
-// Create data directory if it doesn't exist
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// Validate configuration constants
 if (ORDER_DISTANCE <= 0) {
   throw new Error(`Invalid ORDER_DISTANCE: ${ORDER_DISTANCE}, must be positive`);
 }
@@ -63,16 +57,13 @@ if (MAX_ORDER_SIZE_MULTIPLIER < MIN_ORDER_SIZE_MULTIPLIER) {
 
 const run = async (): Promise<void> => {
   try {
-    // Display startup banner
     logger.star('==========================================');
     logger.star('   Prometheus BitMEX Grid Trading Bot    ');
     logger.star('==========================================');
     
-    // Log configuration details
     logger.info(`Trading symbol: ${SYMBOL}`);
     logger.info(`Data directory: ${DATA_DIR}`);
     
-    // Log information about dynamic features
     if (INFINITY_GRID_ENABLED) {
       logger.star('Infinity Grid Mode: ENABLED - Grid will automatically shift to follow price trends');
     } else {
@@ -108,35 +99,19 @@ const run = async (): Promise<void> => {
       logger.star('LIVE TRADING MODE ACTIVATED - REAL ORDERS WILL BE PLACED');
     }
 
-    // InfluxDB metrics configuration
-    const metricsConfig: MetricsConfig = {
-      host: INFLUX_HOST,
-      token: INFLUX_TOKEN,
-      database: INFLUX_DATABASE,
-      enabled: INFLUX_ENABLED,
-      debug: INFLUX_DEBUG
-    };
-
-    // Initialize metrics manager
     let metricsManager: MetricsManager | null = null;
     
     if (INFLUX_ENABLED) {
       logger.info(`Initializing InfluxDB metrics: ${INFLUX_HOST} (${INFLUX_DATABASE})${INFLUX_DEBUG ? ' [DEBUG MODE]' : ''}`);
-      metricsManager = new MetricsManager(logger, metricsConfig, SYMBOL);
+
+      metricsManager = new MetricsManager(logger, {
+        host: INFLUX_HOST,
+        token: INFLUX_TOKEN,
+        database: INFLUX_DATABASE,
+        enabled: INFLUX_ENABLED,
+        debug: INFLUX_DEBUG
+      }, SYMBOL);
       
-      // Log metrics capabilities
-      logger.info('Metrics tracking enabled for:');
-      logger.info('- Trade performance (profit/loss, fees, volume)');
-      logger.info('- Order execution (creation, fills, cancellations)');
-      logger.info('- Grid statistics (distance, trend adaptation)');
-      logger.info('- Position metrics (size, direction, duration, P&L)');
-      logger.info('- Open position tracking (real-time position data)');
-      logger.info('- Grid level profitability (which levels generate most profit)');
-      logger.info('- Fill time distribution (time between fills at each level)');
-      logger.info('- Grid boundary efficiency (how often price hits boundaries)');
-      logger.info('- Grid rebalancing metrics (frequency and impact of shifts)');
-      
-      // Enable additional debug logging if in debug mode
       if (INFLUX_DEBUG) {
         logger.info('Metrics debug mode enabled, additional verbose logging will be shown');
       }
