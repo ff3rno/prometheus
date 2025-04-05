@@ -39,7 +39,8 @@ import {
   BREAKOUT_TIMEOUT_MINUTES,
   BREAKOUT_POSITION_SIZE_MULTIPLIER,
   BREAKOUT_COOLDOWN_MINUTES,
-  POSITION_ROE_CLOSE_THRESHOLD
+  POSITION_ROE_CLOSE_THRESHOLD,
+  STATIC_REFERENCE_PRICE_ENABLED
 } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
@@ -2213,6 +2214,11 @@ export class LiveOrderManager {
       this.logger.info(`Current grid range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}, effective range: ${effectiveLowerBound.toFixed(2)} - ${effectiveUpperBound.toFixed(2)}`);
       this.logger.info(`Price is ${(distanceFromCenter * 100).toFixed(2)}% away from grid center`);
       
+      // If using static reference price, log that we're placing new orders without shifting reference price
+      if (STATIC_REFERENCE_PRICE_ENABLED) {
+        this.logger.info(`STATIC REFERENCE PRICE MODE: Preserving original reference price ${this.referencePrice.toFixed(2)}`);
+      }
+      
       // Shift grid to center around current price
       await this.shiftGrid(currentPrice > gridCenter ? 'up' : 'down');
     }
@@ -2235,7 +2241,6 @@ export class LiveOrderManager {
     const orderCountBeforeShift = this.activeOrders.filter(order => !order.filled).length;
     
     // Get current grid spacing
-    // Get current grid spacing
     const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
     const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
     
@@ -2243,7 +2248,13 @@ export class LiveOrderManager {
     const currentPrice = this.currentMarketPrice;
     let newReferencePrice = currentPrice;
     
-    this.logger.info(`Shifting grid to center around current market price: ${currentPrice.toFixed(2)}`);
+    // If static reference price is enabled, maintain the original reference price
+    if (STATIC_REFERENCE_PRICE_ENABLED) {
+      newReferencePrice = this.referencePrice;
+      this.logger.info(`STATIC REFERENCE PRICE MODE: Maintaining original reference price ${newReferencePrice.toFixed(2)} instead of shifting to ${currentPrice.toFixed(2)}`);
+    } else {
+      this.logger.info(`Shifting grid to center around current market price: ${currentPrice.toFixed(2)}`);
+    }
     
     // Sort orders by price
     const buyOrders = this.activeOrders
@@ -2288,13 +2299,17 @@ export class LiveOrderManager {
       }
     }
     
-    // Update reference price and grid boundaries
-    this.referencePrice = this.roundPriceToTickSize(newReferencePrice);
+    // Update reference price only if not using static reference price
+    if (!STATIC_REFERENCE_PRICE_ENABLED) {
+      this.referencePrice = this.roundPriceToTickSize(newReferencePrice);
+    }
+    
+    // Calculate grid boundaries based on current reference price (which could be static)
     this.gridLowerBound = this.referencePrice - (downwardGridSpacing * ORDER_COUNT);
     this.gridUpperBound = this.referencePrice + (upwardGridSpacing * ORDER_COUNT);
     
-    // Create new grid orders centered around the current price
-    // Create buy orders below the mid price
+    // Create new grid orders centered around the reference price (not current price)
+    // Create buy orders below the reference price
     let currentBuyPrice = this.referencePrice;
     for (let i = 1; i <= ORDER_COUNT; i++) {
       currentBuyPrice -= downwardGridSpacing;
@@ -2325,7 +2340,7 @@ export class LiveOrderManager {
       }
     }
     
-    // Create sell orders above the mid price
+    // Create sell orders above the reference price
     let currentSellPrice = this.referencePrice;
     for (let i = 1; i <= ORDER_COUNT; i++) {
       currentSellPrice += upwardGridSpacing;
@@ -2376,7 +2391,12 @@ export class LiveOrderManager {
       }
     }
     
-    this.logger.star(`Grid successfully centered around current price ${this.currentMarketPrice.toFixed(2)}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+    // Log appropriate message depending on the mode
+    if (STATIC_REFERENCE_PRICE_ENABLED) {
+      this.logger.star(`Grid successfully updated with static reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+    } else {
+      this.logger.star(`Grid successfully centered around current price ${this.currentMarketPrice.toFixed(2)}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+    }
   }
 
   /**

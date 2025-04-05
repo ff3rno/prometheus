@@ -18,7 +18,8 @@ import {
   BREAKOUT_DETECTION_ENABLED,
   BREAKOUT_ATR_THRESHOLD,
   BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
-  BREAKOUT_STOP_LOSS_ATR_MULTIPLE
+  BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
+  STATIC_REFERENCE_PRICE_ENABLED
 } from './constants';
 
 // Load environment variables
@@ -73,6 +74,13 @@ const run = async (): Promise<void> => {
     // Log information about dynamic features
     if (INFINITY_GRID_ENABLED) {
       logger.star('Infinity Grid Mode: ENABLED - Grid will automatically shift to follow price trends');
+      
+      if (STATIC_REFERENCE_PRICE_ENABLED) {
+        logger.star('Static Reference Price: ENABLED - Grid will maintain original reference price when shifting');
+        logger.info('This prevents losing trades that could be caused by reference price changes during grid shifts');
+      } else {
+        logger.info('Static Reference Price: DISABLED - Reference price will change when grid shifts');
+      }
     } else {
       logger.info('Infinity Grid Mode: DISABLED - Grid will remain fixed at initialization price');
     }
