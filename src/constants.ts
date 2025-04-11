@@ -4,7 +4,7 @@ export const BITMEX_WS_API_URL = 'wss://ws.bitmex.com/realtime'
 // Market making parameters
 export const ORDER_COUNT = 3 // Number of orders on each side
 export const ORDER_DISTANCE = 100 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
-export const ORDER_SIZE = 0.004 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
+export const ORDER_SIZE = 0.008 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
 
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.2 // Maximum unrealised ROE to close a position
 
