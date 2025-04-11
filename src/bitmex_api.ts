@@ -550,4 +550,88 @@ export class BitMEXAPI {
       throw error;
     }
   }
+
+  /**
+   * Places a stop limit order on BitMEX
+   */
+  async placeStopLimitOrder(
+    side: 'Buy' | 'Sell', 
+    stopPrice: number, 
+    limitPrice: number, 
+    quantity: number, 
+    symbol: string = 'XBTUSD'
+  ): Promise<BitMEXOrder> {
+    try {
+      // Validate prices are positive
+      if (stopPrice <= 0 || limitPrice <= 0) {
+        throw new Error(`Invalid prices: stop=${stopPrice}, limit=${limitPrice} - must be positive`);
+      }
+      
+      // Fetch instrument details to get the lotSize and tickSize
+      const instrument = await this.getInstrument(symbol);
+      if (!instrument) {
+        throw new Error(`Could not retrieve instrument details for ${symbol}`);
+      }
+      
+      // For FFWCSX instruments like XBTUSD, the quantity needs to be converted to contracts
+      let orderQty: number;
+      
+      // For XBTUSD and similar FFWCSX instruments, quantity needs to be converted to contracts
+      if (symbol.includes('USD')) {
+        // Convert BTC quantity to contract quantity (using limit price for calculation)
+        orderQty = Math.round(quantity * limitPrice);
+        this.logger.debug(`Converting ${quantity} BTC to ${orderQty} contracts at price $${limitPrice} for ${symbol}`);
+      } else {
+        // For other instruments, use the quantity directly
+        orderQty = quantity;
+      }
+      
+      // Ensure the order quantity is a multiple of the lot size
+      const lotSize = instrument.lotSize;
+      const roundedOrderQty = this.roundToLotSize(orderQty, lotSize);
+      
+      if (roundedOrderQty !== orderQty) {
+        this.logger.warn(`Adjusted stop order quantity from ${orderQty} to ${roundedOrderQty} to comply with lot size ${lotSize}`);
+        orderQty = roundedOrderQty;
+      }
+      
+      // Make sure we're not sending a zero order
+      if (orderQty === 0) {
+        orderQty = lotSize; // Use minimum lot size
+        this.logger.warn(`Stop order quantity would be zero after adjustment - using minimum lot size ${lotSize} instead`);
+      }
+
+      // Ensure the prices are multiples of the tick size
+      const tickSize = instrument.tickSize;
+      const roundedStopPrice = this.roundToTickSize(stopPrice, tickSize);
+      const roundedLimitPrice = this.roundToTickSize(limitPrice, tickSize);
+      
+      if (roundedStopPrice !== stopPrice) {
+        this.logger.warn(`Adjusted stop price from ${stopPrice} to ${roundedStopPrice} to comply with tick size ${tickSize}`);
+        stopPrice = roundedStopPrice;
+      }
+      
+      if (roundedLimitPrice !== limitPrice) {
+        this.logger.warn(`Adjusted limit price from ${limitPrice} to ${roundedLimitPrice} to comply with tick size ${tickSize}`);
+        limitPrice = roundedLimitPrice;
+      }
+
+      const orderData = {
+        symbol,
+        side,
+        orderQty,
+        stopPx: stopPrice,
+        price: limitPrice,
+        ordType: 'StopLimit',
+        execInst: 'LastPrice', // Trigger based on last price
+        timeInForce: 'GoodTillCancel'
+      };
+
+      this.logger.info(`Placing ${side} stop limit order: ${orderQty} contracts (${quantity} BTC) @ stop $${stopPrice}, limit $${limitPrice} on ${symbol}`);
+      return await this.makeRequest('POST', '/api/v1/order', orderData);
+    } catch (error) {
+      this.logger.error(`Failed to place ${side} stop limit order at stop ${stopPrice}, limit ${limitPrice}`);
+      throw error;
+    }
+  }
 } 

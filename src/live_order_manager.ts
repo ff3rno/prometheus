@@ -40,7 +40,17 @@ import {
   BREAKOUT_POSITION_SIZE_MULTIPLIER,
   BREAKOUT_COOLDOWN_MINUTES,
   POSITION_ROE_CLOSE_THRESHOLD,
-  STATIC_REFERENCE_PRICE_ENABLED
+  STATIC_REFERENCE_PRICE_ENABLED,
+  POSITION_BALANCING_ENABLED,
+  POSITION_BALANCING_FACTOR,
+  SAFETY_STOPS_ENABLED,
+  SAFETY_STOP_DISTANCE_PERCENT,
+  SAFETY_STOP_SIZE_MULTIPLIER,
+  SAFETY_STOP_TRIGGER_GAP,
+  ROLLING_GRID_ENABLED,
+  ROLLING_GRID_STEP_PERCENT,
+  ROLLING_GRID_KEEP_ORDERS,
+  ROLLING_GRID_SHIFT_DELAY_MS
 } from './constants';
 import { ATR } from 'bfx-hf-indicators';
 
@@ -100,12 +110,30 @@ export class LiveOrderManager {
   private autoShiftCheckIntervalId: NodeJS.Timeout | null = null;
   private lastGridShiftTimestamp: number = 0;
   private readonly GRID_SHIFT_THROTTLE_MS: number = 10000; // Minimum time between grid shifts
+  private lastRollingGridShiftTimestamp: number = 0; // Track last rolling grid shift
 
   private positionStartTimestamp: number = 0;
 
   // Adding a map to store grid level metrics for tracking profits at each level
   private gridLevelMetrics: Map<number, GridLevelMetrics> = new Map();
-
+  private currentPosition: BitMEXPosition | null = null;
+  private _lastBalancingStatsTs: number = 0; // Track when we last logged balancing stats
+  
+  // Track safety stop orders
+  private safetyStopOrders: {
+    upperStopOrderId: string | null;
+    lowerStopOrderId: string | null;
+    upperStopPrice: number;
+    lowerStopPrice: number;
+    lastUpdated: number;
+  } = {
+    upperStopOrderId: null,
+    lowerStopOrderId: null,
+    upperStopPrice: 0,
+    lowerStopPrice: 0,
+    lastUpdated: 0
+  };
+  
   constructor(
     api: BitMEXAPI,
     stateManager: StateManager,
@@ -221,8 +249,12 @@ export class LiveOrderManager {
       
       // Initialize position start timestamp if we have a position
       const position = await this.api.getPosition(this.symbol);
+      this.currentPosition = position;
       if (position && position.currentQty !== 0) {
         this.positionStartTimestamp = Date.now();
+        if (POSITION_BALANCING_ENABLED) {
+          this.logger.info(`Found existing position of ${position.currentQty} contracts - grid will be balanced to help close this position`);
+        }
       }
       
       this.logger.success('Order manager initialized')
@@ -609,7 +641,7 @@ export class LiveOrderManager {
   }
 
   /**
-   * Create an order and place it on the exchange
+   * Create an order and place it on the exchange, with position balancing if enabled
    */
   async createOrder(price: number, size: number, side: 'buy' | 'sell', oppositeOrderPrice: number | null = null): Promise<Order> {
     // Validate price is positive
@@ -622,11 +654,17 @@ export class LiveOrderManager {
     const roundedPrice = this.roundPriceToTickSize(price);
     
     // Apply variable order size calculation if enabled
-    const orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : size;
+    let orderSize = VARIABLE_ORDER_SIZE_ENABLED ? this.calculateVariableOrderSize(roundedPrice, side) : size;
+    
+    // Apply position balancing if enabled
+    if (POSITION_BALANCING_ENABLED && this.currentPosition && this.currentPosition.currentQty !== 0) {
+      orderSize = this.adjustOrderSizeForPositionBalancing(orderSize, side);
+    }
     
     // Log if we're using a variable order size
-    if (VARIABLE_ORDER_SIZE_ENABLED && Math.abs(orderSize - size) > 0.00001) {
-      this.logger.info(`Using variable order size: ${side} @ ${roundedPrice} - adjusted from ${size.toFixed(8)} to ${orderSize.toFixed(8)} BTC`);
+    if ((VARIABLE_ORDER_SIZE_ENABLED || (POSITION_BALANCING_ENABLED && this.currentPosition && this.currentPosition.currentQty !== 0)) 
+        && Math.abs(orderSize - size) > 0.00001) {
+      this.logger.info(`Using adjusted order size: ${side} @ ${roundedPrice} - adjusted from ${size.toFixed(8)} to ${orderSize.toFixed(8)} BTC`);
     }
     
     // Check if we already have an order at this price point
@@ -685,7 +723,7 @@ export class LiveOrderManager {
       const bitmexOrder = await this.api.placeLimitOrder(
         side === 'buy' ? 'Buy' : 'Sell', 
         roundedPrice, 
-        size,
+        orderSize,
         this.symbol
       );
       
@@ -699,7 +737,7 @@ export class LiveOrderManager {
       await this.stateManager.updateActiveOrders(this.activeOrders);
       
       // Log order creation
-      this.logger.success(`Created ${side} order: ${size} BTC @ $${roundedPrice} [${order.bitmexOrderId}]`);
+      this.logger.success(`Created ${side} order: ${orderSize} BTC @ $${roundedPrice} [${order.bitmexOrderId}]`);
       
       // Record order creation metrics
       if (this.metricsManager) {
@@ -720,6 +758,27 @@ export class LiveOrderManager {
     } catch (error) {
       this.logger.error(`Failed to create ${side} order at ${roundedPrice}: ${error}`);
       throw error;
+    }
+  }
+
+  /**
+   * Adjust order size for position balancing
+   */
+  private adjustOrderSizeForPositionBalancing(baseSize: number, side: 'buy' | 'sell'): number {
+    if (!POSITION_BALANCING_ENABLED || !this.currentPosition || this.currentPosition.currentQty === 0) {
+      return baseSize;
+    }
+    
+    const { currentQty } = this.currentPosition;
+    const isLong = currentQty > 0;
+    const isClosingOrder = (isLong && side === 'sell') || (!isLong && side === 'buy');
+    
+    if (isClosingOrder) {
+      // Increase order size for positions that close the existing position
+      return baseSize * POSITION_BALANCING_FACTOR;
+    } else {
+      // Decrease order size for orders that would increase the position
+      return baseSize / POSITION_BALANCING_FACTOR;
     }
   }
 
@@ -995,7 +1054,7 @@ export class LiveOrderManager {
   }
 
   /**
-   * Initialize the ping/pong grid
+   * Initialize the ping/pong grid, with position balancing if enabled
    */
   async initializeGrid(midPrice: number): Promise<void> {
     // Prevent duplicate initializations happening in close succession
@@ -1018,6 +1077,25 @@ export class LiveOrderManager {
         try {
           // Sync state with exchange to ensure we're working with the latest data
           await this.syncWithExchangeOrders();
+          
+          // For position balancing, refresh position information
+          if (POSITION_BALANCING_ENABLED) {
+            try {
+              this.currentPosition = await this.api.getPosition(this.symbol);
+              if (this.currentPosition && this.currentPosition.currentQty !== 0) {
+                this.logger.star(`Position balancing enabled - adjusting grid to help close position of ${this.currentPosition.currentQty} contracts`);
+                
+                // Calculate average size of position-closing orders
+                const posSize = Math.abs(this.currentPosition.currentQty);
+                const gridLevels = ORDER_COUNT;
+                const avgCloseSize = posSize / gridLevels;
+                
+                this.logger.info(`Average position-closing order size will be approximately ${avgCloseSize.toFixed(2)} contracts per level`);
+              }
+            } catch (error) {
+              this.logger.error(`Failed to fetch position for balancing: ${error}`);
+            }
+          }
           
           // Cancel all orders
           await this.api.cancelAllOrders(this.symbol);
@@ -1136,6 +1214,11 @@ export class LiveOrderManager {
       // Update state
       this.stateManager.updateActiveOrders(this.activeOrders);
       this.stateManager.updateReferencePrice(this.referencePrice);
+      
+      // Place safety stop orders if enabled
+      if (SAFETY_STOPS_ENABLED) {
+        await this.manageSafetyStopOrders();
+      }
       
       // Simulate instant fills for orders that would execute at the current price
       this.simulateInstantFills(midPrice);
@@ -1323,11 +1406,53 @@ export class LiveOrderManager {
       this.processedOrderFills.add(orderID);
       
       await this.fillOrder(matchingOrder, executionPrice);
-    } else {
-      this.logger.warn(`Received fill notification for unknown order ${orderID} with ${orderQty} contracts`);
       
-      // Even though we don't know this order, mark it as processed to prevent duplicate processing
-      this.processedOrderFills.add(orderID);
+      // Update position information after fill and update safety stops
+      if (POSITION_BALANCING_ENABLED || SAFETY_STOPS_ENABLED) {
+        await this.updateCurrentPosition();
+        
+        // If it's a safety stop order that was filled, update the safety stops immediately
+        const isUpperStop = this.safetyStopOrders.upperStopOrderId === orderID;
+        const isLowerStop = this.safetyStopOrders.lowerStopOrderId === orderID;
+        
+        if ((isUpperStop || isLowerStop) && SAFETY_STOPS_ENABLED) {
+          this.logger.star(`Safety stop order was filled - ${isUpperStop ? 'upper' : 'lower'} stop triggered!`);
+          
+          // Clear that stop from tracking
+          if (isUpperStop) {
+            this.safetyStopOrders.upperStopOrderId = null;
+          } else if (isLowerStop) {
+            this.safetyStopOrders.lowerStopOrderId = null;
+          }
+          
+          // Regenerate safety stops with the new position
+          await this.manageSafetyStopOrders(true);
+        }
+      }
+    } else {
+      // Check if this is one of our safety stop orders
+      const isUpperStop = this.safetyStopOrders.upperStopOrderId === orderID;
+      const isLowerStop = this.safetyStopOrders.lowerStopOrderId === orderID;
+      
+      if (isUpperStop || isLowerStop) {
+        this.logger.star(`Safety stop order ${orderID} was filled (${isUpperStop ? 'upper/sell' : 'lower/buy'} stop)`);
+        
+        // Clear that stop from tracking
+        if (isUpperStop) {
+          this.safetyStopOrders.upperStopOrderId = null;
+        } else if (isLowerStop) {
+          this.safetyStopOrders.lowerStopOrderId = null;
+        }
+        
+        // Update position and regenerate safety stops
+        await this.updateCurrentPosition();
+        await this.manageSafetyStopOrders(true);
+      } else {
+        this.logger.warn(`Received fill notification for unknown order ${orderID} with ${orderQty} contracts`);
+      
+        // Even though we don't know this order, mark it as processed to prevent duplicate processing
+        this.processedOrderFills.add(orderID);
+      }
       
       // Sync with exchange to ensure local state is up to date
       await this.syncWithExchangeOrders();
@@ -1385,6 +1510,23 @@ export class LiveOrderManager {
     this.syncIntervalId = setInterval(async () => {
       try {
         await this.syncWithExchangeOrders();
+        
+        // Update current position information
+        if (POSITION_BALANCING_ENABLED) {
+          await this.updateCurrentPosition();
+          
+          // Log position balancing stats every few minutes
+          const now = Date.now();
+          if (!this._lastBalancingStatsTs || now - this._lastBalancingStatsTs > 300000) { // Every 5 minutes
+            this.logPositionBalancingStatus();
+            this._lastBalancingStatsTs = now;
+          }
+        }
+        
+        // Check and update safety stops if needed
+        if (SAFETY_STOPS_ENABLED && this.gridInitialized) {
+          await this.manageSafetyStopOrders();
+        }
         
         // Also check for grid gaps during this periodic sync
         if (this.gridInitialized) {
@@ -1649,6 +1791,13 @@ export class LiveOrderManager {
    */
   public cleanup(): void {
     this.logger.info('Cleaning up LiveOrderManager resources')
+    
+    // Cancel safety stop orders
+    if (SAFETY_STOPS_ENABLED) {
+      this.cancelSafetyStopOrders().catch(error => {
+        this.logger.error(`Failed to cancel safety stop orders during cleanup: ${error}`);
+      });
+    }
     
     // Stop periodic sync
     this.stopPeriodicSync()
@@ -2162,6 +2311,13 @@ export class LiveOrderManager {
    * and shift it if necessary
    */
   async checkAndShiftGrid(): Promise<void> {
+    // First check if we should use the rolling grid instead
+    if (ROLLING_GRID_ENABLED && this.gridInitialized) {
+      await this.checkAndRollGrid();
+      return;
+    }
+    
+    // Original infinity grid logic continues here
     if (!INFINITY_GRID_ENABLED || !this.gridInitialized) {
       return;
     }
@@ -2396,6 +2552,246 @@ export class LiveOrderManager {
       this.logger.star(`Grid successfully updated with static reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
     } else {
       this.logger.star(`Grid successfully centered around current price ${this.currentMarketPrice.toFixed(2)}: new reference price ${this.referencePrice.toFixed(2)}, range: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}`);
+    }
+    
+    // Update safety stop orders after grid shift
+    if (SAFETY_STOPS_ENABLED) {
+      await this.manageSafetyStopOrders();
+    }
+  }
+
+  /**
+   * Check if the grid needs to be rolled to follow the current price
+   * This implements a "rolling" grid that moves in steps with the price
+   */
+  private async checkAndRollGrid(): Promise<void> {
+    if (!ROLLING_GRID_ENABLED || !this.gridInitialized) {
+      return;
+    }
+
+    // Don't roll the grid if we've recently done so
+    const now = Date.now();
+    if (now - this.lastRollingGridShiftTimestamp < ROLLING_GRID_SHIFT_DELAY_MS) {
+      return;
+    }
+
+    const currentPrice = this.currentMarketPrice;
+    
+    // Calculate the grid size and determine trigger points for rolling
+    const gridSize = this.gridUpperBound - this.gridLowerBound;
+    const lowerTrigger = this.gridLowerBound + (gridSize * (ROLLING_GRID_STEP_PERCENT / 100));
+    const upperTrigger = this.gridUpperBound - (gridSize * (ROLLING_GRID_STEP_PERCENT / 100));
+    
+    // Check if the price is beyond trigger boundaries
+    const shouldRollUp = currentPrice > upperTrigger;
+    const shouldRollDown = currentPrice < lowerTrigger;
+    
+    if (!shouldRollUp && !shouldRollDown) {
+      return;
+    }
+    
+    this.logger.star(`Price ${currentPrice.toFixed(2)} has reached rolling trigger point`);
+    this.logger.info(`Current grid: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}, Triggers: ${lowerTrigger.toFixed(2)} - ${upperTrigger.toFixed(2)}`);
+    
+    // Roll the grid in the appropriate direction
+    if (shouldRollUp) {
+      this.logger.info(`Rolling grid upward to follow price`);
+      await this.rollGrid('up');
+    } else {
+      this.logger.info(`Rolling grid downward to follow price`);
+      await this.rollGrid('down');
+    }
+  }
+
+  /**
+   * Roll the grid upward or downward to follow the price
+   * This keeps most existing orders and only cancels/creates at the edges
+   */
+  private async rollGrid(direction: 'up' | 'down'): Promise<void> {
+    if (!this.gridInitialized) {
+      this.logger.warn('Cannot roll grid - grid is not initialized');
+      return;
+    }
+    
+    this.lastRollingGridShiftTimestamp = Date.now();
+    
+    // Get current grid spacing
+    const upwardGridSpacing = this.gridSizing.upwardGridSpacing || this.getGridDistance();
+    const downwardGridSpacing = this.gridSizing.downwardGridSpacing || this.getGridDistance();
+    
+    // Calculate how much to shift the grid by
+    // For a rolling grid, we'll shift by a fraction of the total grid size
+    const gridSize = this.gridUpperBound - this.gridLowerBound;
+    const rollPercentage = 1 - (ROLLING_GRID_KEEP_ORDERS / 100);
+    const shiftAmount = gridSize * rollPercentage;
+    
+    // Update grid boundaries
+    const oldLowerBound = this.gridLowerBound;
+    const oldUpperBound = this.gridUpperBound;
+    
+    if (direction === 'up') {
+      this.gridLowerBound += shiftAmount;
+      this.gridUpperBound += shiftAmount;
+      // Update reference price to maintain the same relative position in the grid
+      this.referencePrice += shiftAmount;
+    } else {
+      this.gridLowerBound -= shiftAmount;
+      this.gridUpperBound -= shiftAmount;
+      // Update reference price to maintain the same relative position in the grid
+      this.referencePrice -= shiftAmount;
+    }
+    
+    // Ensure the reference price is rounded to tick size
+    this.referencePrice = this.roundPriceToTickSize(this.referencePrice);
+    
+    // Get active orders by side
+    const buyOrders = this.activeOrders
+      .filter(order => order.side === 'buy' && !order.filled)
+      .sort((a, b) => a.price - b.price); // Sort by price ascending for buys (lowest first)
+      
+    const sellOrders = this.activeOrders
+      .filter(order => order.side === 'sell' && !order.filled)
+      .sort((a, b) => b.price - a.price); // Sort by price descending for sells (highest first)
+    
+    // Determine which orders to cancel based on the rolling direction
+    const ordersToCancel: Order[] = [];
+    
+    if (direction === 'up') {
+      // When rolling up, cancel lowest buy orders
+      const buyOrdersToKeep = Math.floor(buyOrders.length * (ROLLING_GRID_KEEP_ORDERS / 100));
+      const buyOrdersToCancel = buyOrders.slice(0, buyOrders.length - buyOrdersToKeep);
+      ordersToCancel.push(...buyOrdersToCancel);
+      
+      this.logger.info(`Rolling up: Cancelling ${buyOrdersToCancel.length} lowest buy orders, keeping ${buyOrdersToKeep}`);
+    } else {
+      // When rolling down, cancel highest sell orders
+      const sellOrdersToKeep = Math.floor(sellOrders.length * (ROLLING_GRID_KEEP_ORDERS / 100));
+      const sellOrdersToCancel = sellOrders.slice(0, sellOrders.length - sellOrdersToKeep);
+      ordersToCancel.push(...sellOrdersToCancel);
+      
+      this.logger.info(`Rolling down: Cancelling ${sellOrdersToCancel.length} highest sell orders, keeping ${sellOrdersToKeep}`);
+    }
+    
+    // Cancel orders that are no longer in the grid range
+    for (const order of ordersToCancel) {
+      try {
+        if (!this.isDryRun) {
+          await this.api.cancelOrder(order.bitmexOrderId as string);
+        }
+        
+        // Remove from active orders
+        this.activeOrders = this.activeOrders.filter(o => o.id !== order.id);
+        
+        this.logger.success(`Cancelled ${order.side} order at ${order.price} as part of grid roll`);
+        
+        // Record cancellation metrics
+        if (this.metricsManager) {
+          try {
+            this.metricsManager.recordOrderCancellation(
+              order.id,
+              order.side,
+              order.price,
+              order.size
+            );
+          } catch (error) {
+            this.logger.error(`Failed to record order cancellation metrics: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      } catch (error) {
+        this.logger.error(`Failed to cancel order as part of grid roll: ${error}`);
+      }
+    }
+    
+    // Create new orders at the new edge of the grid
+    const currentPrice = this.currentMarketPrice;
+    
+    if (direction === 'up') {
+      // When rolling up, create new sell orders at the top
+      const highestSellOrder = sellOrders.length > 0 ? sellOrders[0].price : this.referencePrice;
+      let newOrderPrice = highestSellOrder + upwardGridSpacing;
+      const numNewOrders = ordersToCancel.length;
+      
+      for (let i = 0; i < numNewOrders; i++) {
+        try {
+          // Skip if price is too close to current price (would immediately fill)
+          if (newOrderPrice <= currentPrice) {
+            this.logger.warn(`Skipping new sell order at ${newOrderPrice.toFixed(2)} - would execute immediately at ${currentPrice.toFixed(2)}`);
+            newOrderPrice += upwardGridSpacing;
+            continue;
+          }
+          
+          const roundedPrice = this.roundPriceToTickSize(newOrderPrice);
+          const sellOrder = await this.createOrder(roundedPrice, ORDER_SIZE, 'sell', null);
+          sellOrder.entryPrice = this.referencePrice;
+          sellOrder.isEntryOrder = true;
+          
+          this.logger.success(`Created new SELL order at ${roundedPrice.toFixed(2)} (top of rolled grid)`);
+          
+          newOrderPrice += upwardGridSpacing;
+        } catch (error) {
+          this.logger.error(`Failed to create new sell order during grid roll: ${error}`);
+        }
+      }
+    } else {
+      // When rolling down, create new buy orders at the bottom
+      const lowestBuyOrder = buyOrders.length > 0 ? buyOrders[0].price : this.referencePrice;
+      let newOrderPrice = lowestBuyOrder - downwardGridSpacing;
+      const numNewOrders = ordersToCancel.length;
+      
+      for (let i = 0; i < numNewOrders; i++) {
+        try {
+          // Skip if price is too close to current price (would immediately fill)
+          if (newOrderPrice >= currentPrice) {
+            this.logger.warn(`Skipping new buy order at ${newOrderPrice.toFixed(2)} - would execute immediately at ${currentPrice.toFixed(2)}`);
+            newOrderPrice -= downwardGridSpacing;
+            continue;
+          }
+          
+          // Ensure we don't create buy orders with negative prices
+          if (newOrderPrice <= 0) {
+            this.logger.warn(`Skipping buy order at negative price point: ${newOrderPrice}`);
+            continue;
+          }
+          
+          const roundedPrice = this.roundPriceToTickSize(newOrderPrice);
+          const buyOrder = await this.createOrder(roundedPrice, ORDER_SIZE, 'buy', null);
+          buyOrder.isEntryOrder = true;
+          
+          this.logger.success(`Created new BUY order at ${roundedPrice.toFixed(2)} (bottom of rolled grid)`);
+          
+          newOrderPrice -= downwardGridSpacing;
+        } catch (error) {
+          this.logger.error(`Failed to create new buy order during grid roll: ${error}`);
+        }
+      }
+    }
+    
+    // Update state
+    this.stateManager.updateActiveOrders(this.activeOrders);
+    this.stateManager.updateReferencePrice(this.referencePrice);
+    
+    // Update safety stop orders after rolling grid
+    if (SAFETY_STOPS_ENABLED) {
+      await this.manageSafetyStopOrders();
+    }
+    
+    this.logger.star(`Grid successfully rolled ${direction}: ${oldLowerBound.toFixed(2)}-${oldUpperBound.toFixed(2)} → ${this.gridLowerBound.toFixed(2)}-${this.gridUpperBound.toFixed(2)}`);
+    
+    // Record metrics if available
+    if (this.metricsManager) {
+      try {
+        this.metricsManager.recordGridRebalancing(
+          direction,
+          oldLowerBound,
+          oldUpperBound,
+          this.gridLowerBound,
+          this.gridUpperBound,
+          ordersToCancel.length,
+          ordersToCancel.length
+        );
+      } catch (error) {
+        this.logger.error(`Failed to record grid rolling metrics: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 
@@ -3046,6 +3442,509 @@ export class LiveOrderManager {
           avgEntryPrice ?? 0,
           this.currentMarketPrice
         );
+      }
+    }
+  }
+
+  /**
+   * Update current position when it changes
+   */
+  private async updateCurrentPosition(): Promise<void> {
+    try {
+      const position = await this.api.getPosition(this.symbol);
+      
+      // Check if position has changed
+      let positionChanged = false;
+      
+      // If position has changed, log the change
+      if (position && this.currentPosition && position.currentQty !== this.currentPosition.currentQty) {
+        this.logger.info(`Position updated: ${this.currentPosition.currentQty} → ${position.currentQty} contracts`);
+        positionChanged = true;
+      } else if (position && !this.currentPosition && position.currentQty !== 0) {
+        this.logger.info(`New position detected: ${position.currentQty} contracts`);
+        positionChanged = true;
+      } else if (!position && this.currentPosition && this.currentPosition.currentQty !== 0) {
+        this.logger.info(`Position closed: previously ${this.currentPosition.currentQty} contracts`);
+        positionChanged = true;
+      }
+      
+      this.currentPosition = position;
+      
+      // Update safety stops if position changed and feature is enabled
+      if (positionChanged && SAFETY_STOPS_ENABLED && this.gridInitialized) {
+        this.logger.info('Position has changed - updating safety stop orders to match new position size');
+        await this.manageSafetyStopOrders(true);
+      }
+    } catch (error) {
+      this.logger.error(`Failed to update current position: ${error}`);
+    }
+  }
+
+  /**
+   * Get current position information 
+   */
+  public getCurrentPosition(): BitMEXPosition | null {
+    return this.currentPosition;
+  }
+
+  /**
+   * Get position balancing stats for diagnostic purposes
+   */
+  public getPositionBalancingStats(): any {
+    if (!POSITION_BALANCING_ENABLED || !this.currentPosition || this.currentPosition.currentQty === 0) {
+      return {
+        enabled: POSITION_BALANCING_ENABLED,
+        active: false,
+        message: 'No active position to balance'
+      };
+    }
+
+    const { currentQty, avgEntryPrice } = this.currentPosition;
+    const isLong = currentQty > 0;
+    const balancingFactor = POSITION_BALANCING_FACTOR;
+    const closingSide = isLong ? 'sell' : 'buy';
+    const increasingSide = isLong ? 'buy' : 'sell';
+    
+    // Count how many orders are helping close vs increase position
+    const closingOrders = this.activeOrders.filter(o => 
+      !o.filled && o.side === closingSide
+    ).length;
+    
+    const increasingOrders = this.activeOrders.filter(o => 
+      !o.filled && o.side === increasingSide
+    ).length;
+    
+    // Calculate size proportions
+    const baseSize = ORDER_SIZE;
+    const closingOrderSize = baseSize * balancingFactor;
+    const increasingOrderSize = baseSize / balancingFactor;
+    
+    // Calculate approx position closing power (how many contracts these orders will close)
+    const closingPower = closingOrders * closingOrderSize * this.currentMarketPrice;
+    const positionSize = Math.abs(currentQty);
+    const closingPercentage = (closingPower / positionSize) * 100;
+    
+    return {
+      enabled: POSITION_BALANCING_ENABLED,
+      active: true,
+      positionSize: currentQty,
+      direction: isLong ? 'long' : 'short',
+      entryPrice: avgEntryPrice,
+      currentPrice: this.currentMarketPrice,
+      balancingFactor,
+      closingSide,
+      increasingSide,
+      closingOrders,
+      increasingOrders,
+      baseSize,
+      closingOrderSize,
+      increasingOrderSize,
+      estimatedClosingPower: closingPower,
+      estimatedClosingPercentage: closingPercentage,
+      message: `${closingOrders} ${closingSide} orders are helping close the ${isLong ? 'long' : 'short'} position with ${closingPercentage.toFixed(2)}% closing power`
+    };
+  }
+
+  /**
+   * Log current position balancing status
+   */
+  public logPositionBalancingStatus(): void {
+    if (!POSITION_BALANCING_ENABLED) {
+      this.logger.info('Position balancing is disabled');
+      return;
+    }
+
+    const stats = this.getPositionBalancingStats();
+    
+    if (!stats.active) {
+      this.logger.info('No active position to balance');
+      return;
+    }
+    
+    this.logger.star(`Position Balancing: ${stats.direction.toUpperCase()} ${Math.abs(stats.positionSize)} contracts @ $${stats.entryPrice?.toFixed(2) || 'unknown'}`);
+    this.logger.info(`${stats.closingOrders} ${stats.closingSide.toUpperCase()} orders (${stats.closingOrderSize.toFixed(8)} BTC) and ${stats.increasingOrders} ${stats.increasingSide.toUpperCase()} orders (${stats.increasingOrderSize.toFixed(8)} BTC)`);
+    this.logger.info(`Estimated closing power: ${stats.estimatedClosingPercentage.toFixed(2)}% of position size`);
+  }
+
+  /**
+   * Create or update safety stop orders outside the grid boundaries
+   */
+  private async manageSafetyStopOrders(forceUpdate: boolean = false): Promise<void> {
+    if (!SAFETY_STOPS_ENABLED || this.isDryRun || !this.gridInitialized) {
+      return;
+    }
+
+    try {
+      const now = Date.now();
+      const gridSize = this.gridUpperBound - this.gridLowerBound;
+      
+      // The constant is defined as a percentage value (e.g., 5.0 means 5%)
+      const stopDistance = gridSize * (SAFETY_STOP_DISTANCE_PERCENT / 100);
+      
+      // Log the actual distance calculation for debugging
+      this.logger.debug(`Calculating safety stops: Grid size=${gridSize.toFixed(2)}, Stop distance=${stopDistance.toFixed(2)} (${SAFETY_STOP_DISTANCE_PERCENT}% of grid size)`);
+      
+      // Calculate stop prices outside the grid
+      const upperStopTriggerPrice = this.gridUpperBound + stopDistance;
+      const lowerStopTriggerPrice = Math.max(this.gridLowerBound - stopDistance, 0.01);
+      
+      // Log the calculated stop prices
+      this.logger.debug(`Grid bounds: ${this.gridLowerBound.toFixed(2)} - ${this.gridUpperBound.toFixed(2)}, Stop prices: ${lowerStopTriggerPrice.toFixed(2)} and ${upperStopTriggerPrice.toFixed(2)}`);
+      
+      // Calculate limit prices with slight offset (worse than trigger price)
+      const upperLimitPrice = upperStopTriggerPrice * (1 + SAFETY_STOP_TRIGGER_GAP / 100);
+      const lowerLimitPrice = lowerStopTriggerPrice * (1 - SAFETY_STOP_TRIGGER_GAP / 100);
+      
+      // Get position information for sizing stops
+      const positionInfo = this.getPositionSummary();
+      const hasPosition = positionInfo.hasPosition;
+      const isLong = positionInfo.isLong;
+      const positionSizeBTC = positionInfo.sizeBTC;
+      
+      // Only update if grid boundaries or prices have changed significantly,
+      // or if position has changed and we're in force update mode
+      const priceThreshold = this.instrumentInfo?.tickSize || 0.5;
+      const shouldUpdate = 
+        forceUpdate ||
+        !this.safetyStopOrders.upperStopOrderId || 
+        !this.safetyStopOrders.lowerStopOrderId ||
+        Math.abs(upperStopTriggerPrice - this.safetyStopOrders.upperStopPrice) > priceThreshold ||
+        Math.abs(lowerStopTriggerPrice - this.safetyStopOrders.lowerStopPrice) > priceThreshold ||
+        (now - this.safetyStopOrders.lastUpdated) > 3600000; // Update at least every hour
+      
+      if (!shouldUpdate) {
+        return;
+      }
+      
+      // Calculate order size based on current position and configuration
+      let stopOrderSize = ORDER_SIZE * SAFETY_STOP_SIZE_MULTIPLIER;
+      
+      // Consider current position direction to increase size where needed
+      let upperStopSize = stopOrderSize;
+      let lowerStopSize = stopOrderSize;
+      
+      // If we have a position, make the opposing side stop larger (to close position)
+      if (hasPosition) {
+        // Make the stop that closes the position larger
+        const safetyBuffer = 1.2; // 20% extra size to ensure full position closure
+        
+        if (isLong) {
+          // For long positions, upper stop (sell) should be large enough to close
+          upperStopSize = Math.max(positionSizeBTC * safetyBuffer, stopOrderSize);
+          this.logger.debug(`Increasing upper (sell) stop size to ${upperStopSize.toFixed(8)} BTC to close long position of ${positionSizeBTC.toFixed(8)} BTC`);
+        } else {
+          // For short positions, lower stop (buy) should be large enough to close
+          lowerStopSize = Math.max(positionSizeBTC * safetyBuffer, stopOrderSize);
+          this.logger.debug(`Increasing lower (buy) stop size to ${lowerStopSize.toFixed(8)} BTC to close short position of ${positionSizeBTC.toFixed(8)} BTC`);
+        }
+      }
+      
+      // First, cancel all existing safety stop orders (not just the ones we're tracking)
+      // This prevents duplicate stops from accumulating
+      let cancelSuccess = false;
+      try {
+        // Cancel all stop orders for this symbol
+        const openOrders = await this.api.getOpenOrders(this.symbol);
+        const stopOrders = openOrders.filter(order => 
+          (order.ordType === 'StopLimit' || order.ordType === 'Stop') && 
+          (order.execInst && order.execInst.includes('LastPrice'))
+        );
+        
+        if (stopOrders.length > 0) {
+          this.logger.info(`Found ${stopOrders.length} existing stop orders to cancel before placing new safety stops`);
+          
+          // Cancel each stop order individually
+          for (const order of stopOrders) {
+            try {
+              await this.api.cancelOrder(order.orderID);
+              this.logger.info(`Cancelled existing stop order ${order.orderID}`);
+            } catch (err) {
+              this.logger.error(`Failed to cancel stop order ${order.orderID}: ${err}`);
+            }
+          }
+        }
+        
+        // Reset our tracking object since we've attempted to cancel all stops
+        this.safetyStopOrders.upperStopOrderId = null;
+        this.safetyStopOrders.lowerStopOrderId = null;
+        cancelSuccess = true;
+      } catch (cancelError) {
+        this.logger.error(`Error cancelling all safety stop orders: ${cancelError}`);
+        // Even if this fails, we'll still try to create new orders after a short delay
+      }
+      
+      // If cancellation was attempted, wait briefly to ensure orders are processed
+      if (cancelSuccess) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      }
+      
+      // Double-check no stop orders remain before placing new ones
+      try {
+        const postCancelOrders = await this.api.getOpenOrders(this.symbol);
+        const remainingStops = postCancelOrders.filter(order => 
+          (order.ordType === 'StopLimit' || order.ordType === 'Stop') && 
+          (order.execInst && order.execInst.includes('LastPrice'))
+        );
+        
+        if (remainingStops.length > 0) {
+          this.logger.warn(`${remainingStops.length} stop orders remain even after cancellation attempt. Will clear tracking.`);
+          this.safetyStopOrders.upperStopOrderId = null;
+          this.safetyStopOrders.lowerStopOrderId = null;
+        }
+      } catch (checkError) {
+        this.logger.error(`Error checking remaining stop orders: ${checkError}`);
+      }
+      
+      // Ensure position size is current before placing orders
+      if (forceUpdate && hasPosition) {
+        this.logger.info(`Placing safety stops to match current ${isLong ? 'LONG' : 'SHORT'} position of ${positionSizeBTC.toFixed(8)} BTC`);
+      }
+      
+      // Place upper stop (sell if price spikes up too quickly)
+      let upperStopOrder;
+      try {
+        upperStopOrder = await this.api.placeStopLimitOrder(
+          'Sell',
+          upperStopTriggerPrice,
+          upperLimitPrice,
+          upperStopSize,
+          this.symbol
+        );
+        this.logger.success(`Placed upper safety stop: SELL ${upperStopSize.toFixed(8)} BTC at $${upperStopTriggerPrice.toFixed(2)}`);
+      } catch (upperError) {
+        this.logger.error(`Failed to place upper safety stop: ${upperError}`);
+        upperStopOrder = { orderID: null };
+      }
+      
+      // Place lower stop (buy if price drops too quickly)
+      let lowerStopOrder;
+      try {
+        lowerStopOrder = await this.api.placeStopLimitOrder(
+          'Buy',
+          lowerStopTriggerPrice,
+          lowerLimitPrice,
+          lowerStopSize,
+          this.symbol
+        );
+        this.logger.success(`Placed lower safety stop: BUY ${lowerStopSize.toFixed(8)} BTC at $${lowerStopTriggerPrice.toFixed(2)}`);
+      } catch (lowerError) {
+        this.logger.error(`Failed to place lower safety stop: ${lowerError}`);
+        lowerStopOrder = { orderID: null };
+      }
+      
+      // Update stop order tracking only if both orders were successfully placed
+      this.safetyStopOrders = {
+        upperStopOrderId: upperStopOrder.orderID,
+        lowerStopOrderId: lowerStopOrder.orderID,
+        upperStopPrice: upperStopTriggerPrice,
+        lowerStopPrice: lowerStopTriggerPrice,
+        lastUpdated: now
+      };
+      
+      this.logger.star('Safety stop orders updated:');
+      this.logger.info(`Upper stop: SELL ${upperStopSize.toFixed(8)} BTC at $${upperStopTriggerPrice.toFixed(2)} (trigger) → $${upperLimitPrice.toFixed(2)} (limit) [${upperStopOrder.orderID || 'FAILED'}]`);
+      this.logger.info(`Lower stop: BUY ${lowerStopSize.toFixed(8)} BTC at $${lowerStopTriggerPrice.toFixed(2)} (trigger) → $${lowerLimitPrice.toFixed(2)} (limit) [${lowerStopOrder.orderID || 'FAILED'}]`);
+      this.logger.info(`Distance from grid: ${stopDistance.toFixed(2)} (${SAFETY_STOP_DISTANCE_PERCENT}% of grid size ${gridSize.toFixed(2)})`);
+      
+      // If we have a position, log extra info
+      if (hasPosition) {
+        this.logger.info(`Safety stops adjusted for current ${isLong ? 'LONG' : 'SHORT'} position of ${positionSizeBTC.toFixed(8)} BTC (${positionInfo.contractSize} contracts)`);
+      }
+    } catch (error) {
+      this.logger.error(`Failed to place safety stop orders: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Cancel existing safety stop orders
+   */
+  private async cancelSafetyStopOrders(): Promise<void> {
+    if (!SAFETY_STOPS_ENABLED || this.isDryRun) {
+      return;
+    }
+    
+    try {
+      // First attempt to cancel the specific orders we're tracking
+      let canceledCount = 0;
+      
+      if (this.safetyStopOrders.upperStopOrderId) {
+        try {
+          await this.api.cancelOrder(this.safetyStopOrders.upperStopOrderId);
+          this.logger.info(`Cancelled upper safety stop order ${this.safetyStopOrders.upperStopOrderId}`);
+          canceledCount++;
+        } catch (error) {
+          this.logger.warn(`Error cancelling upper safety stop order ${this.safetyStopOrders.upperStopOrderId}: ${error}`);
+        }
+      }
+      
+      if (this.safetyStopOrders.lowerStopOrderId) {
+        try {
+          await this.api.cancelOrder(this.safetyStopOrders.lowerStopOrderId);
+          this.logger.info(`Cancelled lower safety stop order ${this.safetyStopOrders.lowerStopOrderId}`);
+          canceledCount++;
+        } catch (error) {
+          this.logger.warn(`Error cancelling lower safety stop order ${this.safetyStopOrders.lowerStopOrderId}: ${error}`);
+        }
+      }
+      
+      // Clear the stop order tracking regardless of success/failure
+      this.safetyStopOrders.upperStopOrderId = null;
+      this.safetyStopOrders.lowerStopOrderId = null;
+      
+      // If we didn't cancel any orders, try to find all stop orders for this symbol 
+      // as a fallback to ensure we don't have stranded stop orders
+      if (canceledCount === 0) {
+        this.logger.warn("No tracked safety stop orders were canceled, checking for any stop orders");
+        const openOrders = await this.api.getOpenOrders(this.symbol);
+        const stopOrders = openOrders.filter(order => 
+          (order.ordType === 'StopLimit' || order.ordType === 'Stop') && 
+          (order.execInst && order.execInst.includes('LastPrice'))
+        );
+        
+        if (stopOrders.length > 0) {
+          this.logger.warn(`Found ${stopOrders.length} untracked stop orders, attempting to cancel them`);
+          
+          for (const order of stopOrders) {
+            try {
+              await this.api.cancelOrder(order.orderID);
+              this.logger.info(`Cancelled untracked stop order ${order.orderID}`);
+            } catch (error) {
+              this.logger.error(`Failed to cancel untracked stop order ${order.orderID}: ${error}`);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(`Error cancelling safety stop orders: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Get information about safety stop orders
+   */
+  public getSafetyStopOrderInfo(): any {
+    if (!SAFETY_STOPS_ENABLED) {
+      return {
+        enabled: false,
+        message: 'Safety stop orders are disabled'
+      };
+    }
+    
+    const { upperStopOrderId, lowerStopOrderId, upperStopPrice, lowerStopPrice, lastUpdated } = this.safetyStopOrders;
+    const gridSize = this.gridUpperBound - this.gridLowerBound;
+    const stopSize = ORDER_SIZE * SAFETY_STOP_SIZE_MULTIPLIER;
+    
+    return {
+      enabled: true,
+      active: !!(upperStopOrderId && lowerStopOrderId),
+      upperStop: {
+        orderId: upperStopOrderId,
+        triggerPrice: upperStopPrice,
+        limitPrice: upperStopPrice * (1 + SAFETY_STOP_TRIGGER_GAP / 100),
+        size: stopSize
+      },
+      lowerStop: {
+        orderId: lowerStopOrderId,
+        triggerPrice: lowerStopPrice,
+        limitPrice: lowerStopPrice * (1 - SAFETY_STOP_TRIGGER_GAP / 100),
+        size: stopSize
+      },
+      gridInfo: {
+        upperBound: this.gridUpperBound,
+        lowerBound: this.gridLowerBound,
+        size: gridSize,
+        distancePercent: SAFETY_STOP_DISTANCE_PERCENT,
+        lastUpdated: new Date(lastUpdated).toISOString()
+      },
+      message: `Safety stops: Upper at $${upperStopPrice.toFixed(2)}, Lower at $${lowerStopPrice.toFixed(2)}`
+    };
+  }
+
+  /**
+   * Log current safety stop order status
+   */
+  public logSafetyStopStatus(): void {
+    if (!SAFETY_STOPS_ENABLED) {
+      this.logger.info('Safety stop orders are disabled');
+      return;
+    }
+
+    const info = this.getSafetyStopOrderInfo();
+    
+    if (!info.active) {
+      this.logger.info('No active safety stop orders');
+      return;
+    }
+    
+    this.logger.star(`Safety Stop Orders: Active outside grid range $${info.gridInfo.lowerBound.toFixed(2)} - $${info.gridInfo.upperBound.toFixed(2)}`);
+    this.logger.info(`Upper stop: SELL ${info.upperStop.size} BTC at $${info.upperStop.triggerPrice.toFixed(2)} (Order: ${info.upperStop.orderId || 'N/A'})`);
+    this.logger.info(`Lower stop: BUY ${info.lowerStop.size} BTC at $${info.lowerStop.triggerPrice.toFixed(2)} (Order: ${info.lowerStop.orderId || 'N/A'})`);
+    this.logger.info(`Last updated: ${info.gridInfo.lastUpdated}`);
+  }
+
+  /**
+   * Get a summary of the current position
+   */
+  private getPositionSummary(): {
+    hasPosition: boolean;
+    isLong: boolean;
+    sizeBTC: number;
+    contractSize: number;
+    entryPrice: number;
+  } {
+    // Default values
+    const summary = {
+      hasPosition: false,
+      isLong: false,
+      sizeBTC: 0,
+      contractSize: 0,
+      entryPrice: 0
+    };
+    
+    if (!this.currentPosition || !this.currentPosition.currentQty || this.currentPosition.currentQty === 0) {
+      return summary;
+    }
+    
+    // We have a position
+    const currentQty = this.currentPosition.currentQty;
+    const entryPrice = this.currentPosition.avgEntryPrice || this.currentMarketPrice;
+    const isLong = currentQty > 0;
+    const contractSize = Math.abs(currentQty);
+    
+    // For XBTUSD, 1 contract = $1, so position size in BTC = contracts / price
+    const sizeBTC = contractSize / (this.currentMarketPrice || entryPrice);
+    
+    return {
+      hasPosition: true,
+      isLong,
+      sizeBTC,
+      contractSize,
+      entryPrice
+    };
+  }
+
+  /**
+   * Event handler for when a position changes (for WebSocket events)
+   */
+  public async handlePositionChange(positionData: any): Promise<void> {
+    if (!positionData || positionData.symbol !== this.symbol) {
+      return;
+    }
+    
+    // Check if the position actually changed
+    const hasChanged = !this.currentPosition || 
+                      (this.currentPosition.currentQty !== positionData.currentQty);
+    
+    // Update our current position data
+    this.currentPosition = positionData;
+    
+    if (hasChanged) {
+      this.logger.info(`Position update via WebSocket: ${positionData.currentQty} contracts`);
+      
+      // Update safety stops if feature is enabled
+      if (SAFETY_STOPS_ENABLED && this.gridInitialized) {
+        this.logger.info('Position changed - updating safety stops to match new position size');
+        await this.manageSafetyStopOrders(true);
       }
     }
   }

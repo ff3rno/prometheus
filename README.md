@@ -8,11 +8,18 @@ Prometheus implements an advanced grid trading system for BitMEX that automatica
 
 ## Key Features
 
-- **Adaptive Grid Trading**
-  - Dynamic grid spacing based on Average True Range (ATR)
-  - Asymmetric grid positioning aligned with detected market trends
-  - Automated grid shifting when price approaches boundaries
+- **Advanced Grid Trading Systems**
+  - **Rolling Grid**: Follows price in fixed steps, maintaining order spread with minimal cancellations
+  - **Adaptive Grid**: Spacing based on Average True Range (ATR) with dynamic adjustments
+  - **Asymmetric Grid**: Positioning aligned with detected market trends
+  - **Infinity Grid**: Automated shifting when price approaches boundaries
   - Intelligent gap detection and repair during operation
+
+- **Position Management & Protection**
+  - **Safety Stop Orders**: Automatic stop limits outside grid boundaries to protect against sudden moves
+  - **Position Balancing**: Automatic adjustment of order sizes to help close open positions
+  - **Position Size Limits**: Prevent excessive risk through configurable position size caps
+  - **Auto-Close**: Automatically close profitable positions based on ROE thresholds
 
 - **Breakout Trading Mode**
   - Automated breakout detection beyond normal grid boundaries
@@ -128,21 +135,35 @@ Fine-tune trading behavior by modifying constants in `src/constants.ts`:
 - `ORDER_DISTANCE`: Base distance between orders in USD
 - `ORDER_SIZE`: Base size of each order in BTC
 - `ENFORCE_ORDER_DISTANCE`: Whether to strictly enforce minimum distance between orders
-- `GRID_LOWER_BOUND`: Lower price boundary for the grid
-- `GRID_UPPER_BOUND`: Upper price boundary for the grid
 
 ### Risk Management
 - `MAX_POSITION_SIZE_BTC`: Maximum allowed position size in BTC
 - `MAX_OPEN_ORDERS`: Maximum number of open orders allowed
 - `FEE_RATE`: Trading fee rate in percentage
-- `POSITION_RISK_LIMIT`: Maximum risk exposure allowed
+- `POSITION_ROE_CLOSE_THRESHOLD`: Maximum unrealized ROE to trigger position close
+
+### Rolling Grid Configuration
+- `ROLLING_GRID_ENABLED`: Enable grid that follows price in fixed steps
+- `ROLLING_GRID_STEP_PERCENT`: Percentage of grid edge to trigger grid roll
+- `ROLLING_GRID_KEEP_ORDERS`: Percentage of orders to maintain during roll
+- `ROLLING_GRID_SHIFT_DELAY_MS`: Minimum delay between grid shifts
+
+### Position Balancing
+- `POSITION_BALANCING_ENABLED`: Enable automatic position size balancing
+- `POSITION_BALANCING_FACTOR`: Factor to increase close order sizes
+
+### Safety Stop Orders
+- `SAFETY_STOPS_ENABLED`: Enable safety stop orders outside grid boundaries
+- `SAFETY_STOP_DISTANCE_PERCENT`: Distance from grid boundary as percentage of grid size
+- `SAFETY_STOP_SIZE_MULTIPLIER`: Size multiplier for stop orders
+- `SAFETY_STOP_TRIGGER_GAP`: Gap between trigger and limit price for stops
 
 ### Dynamic Grid Features
 - `INFINITY_GRID_ENABLED`: Enable grid that automatically shifts with market movement
 - `GRID_SHIFT_THRESHOLD`: When to shift grid based on price movement
 - `GRID_SHIFT_OVERLAP`: Percentage of orders to keep when shifting
 - `GRID_AUTO_SHIFT_CHECK_INTERVAL`: How often to check for grid shifts
-- `GRID_SHIFT_THROTTLE_MS`: Minimum time between grid shifts
+- `STATIC_REFERENCE_PRICE_ENABLED`: Maintain original reference price during shifts
 
 ### Variable Order Sizing
 - `VARIABLE_ORDER_SIZE_ENABLED`: Enable dynamic order sizing based on price levels
@@ -151,12 +172,11 @@ Fine-tune trading behavior by modifying constants in `src/constants.ts`:
 - `MIN_ORDER_SIZE_MULTIPLIER`: Minimum multiplier for order size at high prices
 
 ### Breakout Trading
-- `BREAKOUT_ENABLED`: Enable breakout trading functionality
-- `BREAKOUT_ATR_MULTIPLIER`: ATR multiplier to determine breakout threshold
-- `BREAKOUT_MAX_DURATION_MS`: Maximum duration of a breakout trade
-- `BREAKOUT_TAKE_PROFIT_MULTIPLIER`: Take profit level as ATR multiplier
-- `BREAKOUT_STOP_LOSS_MULTIPLIER`: Stop loss level as ATR multiplier
-- `BREAKOUT_POSITION_SIZE`: Size of breakout trades relative to grid trades
+- `BREAKOUT_DETECTION_ENABLED`: Enable breakout trading functionality
+- `BREAKOUT_ATR_THRESHOLD`: ATR multiplier to determine breakout threshold
+- `BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE`: Take profit level as ATR multiplier
+- `BREAKOUT_STOP_LOSS_ATR_MULTIPLE`: Stop loss level as ATR multiplier
+- `BREAKOUT_POSITION_SIZE_MULTIPLIER`: Size of breakout trades relative to grid trades
 
 ### Technical Indicators
 - `ATR_PERIOD`: Period for ATR calculation
@@ -171,6 +191,55 @@ Fine-tune trading behavior by modifying constants in `src/constants.ts`:
 - `SEC_POLL_INTERVAL_MS`: Interval between SEC feed checks
 - `SEC_COMPANY_FILTER`: List of company CIKs to monitor
 - `SEC_FILING_TYPES`: Types of filings to monitor
+
+## Grid Trading Strategies
+
+Prometheus offers multiple grid trading strategies that can be configured based on your trading preferences:
+
+### Rolling Grid
+
+The Rolling Grid strategy follows price movements in fixed steps while maintaining order spread. Unlike traditional grid systems, it preserves most existing orders during price shifts:
+
+- **Efficient Order Management**: Only cancels orders at the edge being left behind (20-30% of orders)
+- **Consistent Trade Opportunities**: Maintains active orders close to current price at all times
+- **Reduced Trading Costs**: Minimizes the number of cancellations and new order placements
+- **Predictable Spacing**: Maintains consistent grid spacing across price movements
+
+### Infinity Grid
+
+The Infinity Grid strategy allows the grid to automatically shift with significant price movements:
+
+- **Adaptable Boundaries**: Grid shifts when price approaches boundaries
+- **Configurable Overlap**: Control how many orders to maintain during shifts
+- **Static Reference Option**: Maintain original reference price to prevent losing trades
+
+### Traditional Fixed Grid
+
+A standard grid centered around a specific price:
+
+- **Stability**: Grid boundaries remain fixed once initialized
+- **Simplicity**: Easier to reason about and predict behavior
+- **Well-Suited**: Ideal for range-bound markets
+
+## Risk Protection Features
+
+### Safety Stop Orders
+
+Safety stops provide crucial protection against sudden price movements:
+
+- **Grid Extension**: Places stop orders outside normal grid boundaries
+- **Position-Aware**: Automatically sizes stops to match and close your current position
+- **Sudden Move Protection**: Guards against price gaps that could leave grid one-sided
+- **Auto-Adjustment**: Stops are automatically updated when position size changes
+
+### Position Balancing
+
+Position balancing helps manage and reduce open positions:
+
+- **Size Adjustment**: Creates larger orders in the direction that closes position
+- **Risk Reduction**: Reduces size of orders that would increase position further
+- **Continuous Monitoring**: Adjusts order sizes as position changes
+- **Configurable Aggressiveness**: Control how aggressively to close positions
 
 ## Usage
 

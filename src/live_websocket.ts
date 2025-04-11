@@ -133,16 +133,17 @@ export class LiveWebSocket {
     if (this.apiKey && this.apiSecret) {
       this.authenticate();
       
-      // Subscribe to XBT/USD trade data and execution data (for order fills)
+      // Subscribe to XBT/USD trade data, execution data, and position updates
       this.ws.send(JSON.stringify({
         op: 'subscribe',
         args: [
           `trade:${this.symbol}`,
           'execution',
-          'order'
+          'order',
+          'position' // Added position subscription for safety stop updates
         ]
       }));
-      this.logger.success(`Subscribed to ${this.symbol} trade data and execution updates`);
+      this.logger.success(`Subscribed to ${this.symbol} trade data, execution updates, and position updates`);
       
       // Request current state of orders
       this.ws.send(JSON.stringify({
@@ -186,6 +187,18 @@ export class LiveWebSocket {
             execution.side,
             execution.lastQty
           );
+        }
+      });
+    }
+    // Handle position updates for safety stops
+    else if (message.table === 'position' && message.data && message.data.length > 0) {
+      // Process each position update
+      message.data.forEach((position: any) => {
+        if (position.symbol === this.symbol) {
+          this.logger.debug(`Position update received: ${position.currentQty} contracts at ${position.avgEntryPrice}${position.unrealisedRoePcnt !== undefined ? ` (ROE: ${(position.unrealisedRoePcnt * 100).toFixed(2)}%)` : ''}`);
+          
+          // Forward position update to the order manager for safety stop updates
+          this.orderManager.handlePositionChange(position);
         }
       });
     }

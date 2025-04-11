@@ -19,7 +19,16 @@ import {
   BREAKOUT_ATR_THRESHOLD,
   BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE,
   BREAKOUT_STOP_LOSS_ATR_MULTIPLE,
-  STATIC_REFERENCE_PRICE_ENABLED
+  STATIC_REFERENCE_PRICE_ENABLED,
+  POSITION_BALANCING_ENABLED,
+  POSITION_BALANCING_FACTOR,
+  POSITION_ROE_CLOSE_THRESHOLD,
+  SAFETY_STOPS_ENABLED,
+  SAFETY_STOP_DISTANCE_PERCENT,
+  SAFETY_STOP_SIZE_MULTIPLIER,
+  ROLLING_GRID_ENABLED,
+  ROLLING_GRID_STEP_PERCENT,
+  ROLLING_GRID_KEEP_ORDERS
 } from './constants';
 
 // Load environment variables
@@ -72,7 +81,12 @@ const run = async (): Promise<void> => {
     logger.info(`Data directory: ${DATA_DIR}`);
     
     // Log information about dynamic features
-    if (INFINITY_GRID_ENABLED) {
+    if (ROLLING_GRID_ENABLED) {
+      logger.star('Rolling Grid Mode: ENABLED - Grid follows price in fixed steps, maintaining spread');
+      logger.info(`Step trigger: Price reaches ${ROLLING_GRID_STEP_PERCENT}% of grid edge`);
+      logger.info(`Order retention: ${ROLLING_GRID_KEEP_ORDERS}% of orders kept during grid roll`);
+      logger.info('This mode ensures continuous trading as price moves, with less order cancellations');
+    } else if (INFINITY_GRID_ENABLED) {
       logger.star('Infinity Grid Mode: ENABLED - Grid will automatically shift to follow price trends');
       
       if (STATIC_REFERENCE_PRICE_ENABLED) {
@@ -82,7 +96,7 @@ const run = async (): Promise<void> => {
         logger.info('Static Reference Price: DISABLED - Reference price will change when grid shifts');
       }
     } else {
-      logger.info('Infinity Grid Mode: DISABLED - Grid will remain fixed at initialization price');
+      logger.info('Fixed Grid Mode: ENABLED - Grid will remain fixed at initialization price');
     }
     
     if (VARIABLE_ORDER_SIZE_ENABLED) {
@@ -97,6 +111,26 @@ const run = async (): Promise<void> => {
       logger.info(`Breakout settings: ATR Threshold: ${BREAKOUT_ATR_THRESHOLD}x, Profit Target: ${BREAKOUT_PROFIT_TARGET_ATR_MULTIPLE}x ATR, Stop Loss: ${BREAKOUT_STOP_LOSS_ATR_MULTIPLE}x ATR`);
     } else {
       logger.info('Breakout Detection: DISABLED - Grid trading will continue during all market conditions');
+    }
+    
+    // Log information about position balancing
+    if (POSITION_BALANCING_ENABLED) {
+      logger.star('Position Balancing: ENABLED - Grid will adjust order sizes to help close open positions');
+      logger.info(`Position balancing factor: ${POSITION_BALANCING_FACTOR.toFixed(2)}x (higher = more aggressive closing)`);
+      logger.info(`Auto-close threshold: ${(POSITION_ROE_CLOSE_THRESHOLD * 100).toFixed(2)}% ROE`);
+    } else {
+      logger.info('Position Balancing: DISABLED - Grid will use consistent order sizes regardless of position');
+    }
+    
+    // Log information about safety stop orders
+    if (SAFETY_STOPS_ENABLED) {
+      logger.star('Safety Stop Orders: ENABLED - Will place stop limit orders outside grid boundaries');
+      logger.info(`Distance from grid boundary: ${SAFETY_STOP_DISTANCE_PERCENT.toFixed(1)}% of grid size`);
+      logger.info(`Order size multiplier: ${SAFETY_STOP_SIZE_MULTIPLIER.toFixed(1)}x regular grid orders`);
+      logger.info('These stops protect against sudden price moves that leave grid one-sided');
+      logger.info('Safety stops automatically adjust to match and close out your position size');
+    } else {
+      logger.info('Safety Stop Orders: DISABLED - No automatic stop orders outside grid');
     }
     
     if (DRY_RUN) {
