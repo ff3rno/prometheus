@@ -2,8 +2,8 @@
 export const BITMEX_WS_API_URL = 'wss://ws.bitmex.com/realtime'
 
 // Market making parameters
-export const ORDER_COUNT = 3 // Number of orders on each side
-export const ORDER_DISTANCE = 110 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
+export const ORDER_COUNT = 8 // Number of orders on each side
+export const ORDER_DISTANCE = 250 // Distance between each order in USD (must be positive and appropriate for the instrument price range)
 export const ORDER_SIZE = 0.003 // Size of each order in BTC (for FFWCSX instruments like XBTUSD, this will be converted to contracts using price)
 
 export const POSITION_ROE_CLOSE_THRESHOLD = 0.1 // Maximum unrealised ROE to close a position
@@ -24,13 +24,13 @@ export const ROLLING_GRID_SHIFT_DELAY_MS = 5000 // Minimum delay between grid sh
 
 // Safety measures
 export const MAX_POSITION_SIZE_BTC = 0.05 // Maximum allowed position size in BTC
-export const MAX_OPEN_ORDERS = 8 // Maximum number of open orders allowed
+export const MAX_OPEN_ORDERS = 20 // Maximum number of open orders allowed
 
 // ATR parameters for dynamic grid sizing
 export const ATR_PERIOD = 14 // Period for ATR calculation
-export const ATR_MULTIPLIER = 1.5 // Multiplier for ATR to determine grid spacing
-export const ATR_MINIMUM_GRID_DISTANCE = 110 // Minimum grid distance in USD (increased for safety)
-export const ATR_MAXIMUM_GRID_DISTANCE = 140 // Maximum grid distance in USD (increased for higher price volatility)
+export const ATR_MULTIPLIER = 6.5 // Multiplier for ATR to determine grid spacing
+export const ATR_MINIMUM_GRID_DISTANCE = 250 // Minimum grid distance in USD (increased for safety)
+export const ATR_MAXIMUM_GRID_DISTANCE = 900 // Maximum grid distance in USD (increased for higher price volatility)
 export const GAP_DETECTION_TOLERANCE = 2.0 // Multiplier for grid distance to identify gaps (higher = less sensitive)
 export const ATR_RECALCULATION_INTERVAL =  1000 * 60 * 15 // Recalculate ATR
 export const ATR_HISTORICAL_TRADES_LOOKBACK = 90 // How many minutes to look back for historical trades
@@ -68,6 +68,16 @@ export const BREAKOUT_STOP_LOSS_ATR_MULTIPLE = 1.0 // Stop loss at this multiple
 export const BREAKOUT_TIMEOUT_MINUTES = 60 // Maximum time to stay in breakout mode before reverting to grid trading
 export const BREAKOUT_POSITION_SIZE_MULTIPLIER = 2.0 // Multiplier for position size during breakout trades
 export const BREAKOUT_COOLDOWN_MINUTES = 60 // Minimum time between breakout trades
+
+// Volatility-based opportunistic trading parameters
+export const VOLATILITY_TRADING_ENABLED = true // Enable opportunistic trading during high volatility
+export const VOLATILITY_ATR_THRESHOLD = 1.5 // ATR multiple that indicates high volatility (compared to 20-day average)
+export const VOLATILITY_ORDER_SIZE_MULTIPLIER = 1.5 // Increase order size during high volatility periods
+export const VOLATILITY_GRID_TIGHTENING = 0.8 // Tighten grid spacing during high volatility (multiplier < 1.0)
+export const VOLATILITY_MAX_POSITION_INCREASE = 1.3 // Allow larger positions during volatility (multiplier for MAX_POSITION_SIZE_BTC)
+export const VOLATILITY_ATR_LOOKBACK_DAYS = 20 // Days to look back for ATR baseline calculation
+export const VOLATILITY_CHECK_INTERVAL = 1000 * 60 * 5 // Check volatility every 5 minutes
+export const VOLATILITY_COOLDOWN_MINUTES = 30 // Minimum time between volatility trading mode switches
 
 // Sync interval for checking order statuses (in milliseconds)
 export const ORDER_SYNC_INTERVAL = 60000 // 60 seconds

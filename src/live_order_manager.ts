@@ -283,7 +283,13 @@ export class LiveOrderManager {
       
       if (!trades || trades.length === 0) {
         this.logger.warn(`No historical trades found for ${this.symbol}, using default ATR values`)
-        return
+        // Set a reasonable default ATR value
+        this.gridSizing.lastATRValue = ATR_MINIMUM_GRID_DISTANCE / ATR_MULTIPLIER;
+        this.gridSizing.currentDistance = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.upwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.downwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.lastRecalculation = Date.now();
+        return;
       }
       
       this.logger.info(`Retrieved ${trades.length} historical trades for ATR calculation`)
@@ -294,7 +300,13 @@ export class LiveOrderManager {
       
       if (candles.length < ATR_PERIOD + 1) {
         this.logger.warn(`Not enough candles for proper ATR initialization: ${candles.length} < ${ATR_PERIOD + 1}`)
-        return
+        // Set a reasonable default ATR value
+        this.gridSizing.lastATRValue = ATR_MINIMUM_GRID_DISTANCE / ATR_MULTIPLIER;
+        this.gridSizing.currentDistance = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.upwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.downwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.lastRecalculation = Date.now();
+        return;
       }
       
       // Reset ATR indicator with proper period
@@ -302,6 +314,13 @@ export class LiveOrderManager {
       
       // Feed historical candles to ATR indicator
       this.logger.info(`Feeding ${candles.length} historical candles to ATR indicator`)
+      
+      // Track the oldest candle time to know when we've reached real-time data
+      const oldestCandleTime = candles[0].timestamp;
+      const latestCandleTime = candles[candles.length - 1].timestamp;
+      const timespanHours = (latestCandleTime - oldestCandleTime) / (1000 * 60 * 60);
+      
+      this.logger.debug(`Candle history covers ${timespanHours.toFixed(2)} hours (${new Date(oldestCandleTime).toISOString()} to ${new Date(latestCandleTime).toISOString()})`);
       
       // Make sure we're handling different candle formats properly
       for (const candle of candles) {
@@ -313,7 +332,7 @@ export class LiveOrderManager {
         
         // Add to ATR indicator if we have valid values
         if (open && high && low && close) {
-          this.atrInstance.add(open, high, low, close)
+          this.atrInstance.add(candle)
         }
       }
       
@@ -321,14 +340,26 @@ export class LiveOrderManager {
       const atrValues = this.atrInstance._values as number[]
       if (!atrValues || atrValues.length === 0) {
         this.logger.warn('No ATR values calculated from historical data')
-        return
+        // Set a reasonable default ATR value
+        this.gridSizing.lastATRValue = ATR_MINIMUM_GRID_DISTANCE / ATR_MULTIPLIER;
+        this.gridSizing.currentDistance = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.upwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.downwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.lastRecalculation = Date.now();
+        return;
       }
       
       const atrValue = atrValues[atrValues.length - 1]
       
       if (!atrValue || isNaN(atrValue)) {
         this.logger.warn('Invalid ATR value calculated from historical data')
-        return
+        // Set a reasonable default ATR value
+        this.gridSizing.lastATRValue = ATR_MINIMUM_GRID_DISTANCE / ATR_MULTIPLIER;
+        this.gridSizing.currentDistance = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.upwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.downwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+        this.gridSizing.lastRecalculation = Date.now();
+        return;
       }
       
       this.logger.success(`ATR initialized successfully: ${atrValue.toFixed(2)}`)
@@ -362,9 +393,34 @@ export class LiveOrderManager {
       
       // Update breakout detector with current ATR value
       this.breakoutDetector.updateAtrValue(atrValue)
+      
+      // Record initial metrics if available
+      if (this.metricsManager) {
+        this.metricsManager.recordATR(atrValue);
+        this.metricsManager.recordGridDistance(baseGridDistance);
+        
+        const upSpacing = this.gridSizing.upwardGridSpacing || baseGridDistance;
+        const downSpacing = this.gridSizing.downwardGridSpacing || baseGridDistance;
+        
+        this.metricsManager.recordTrendMetrics(
+          this.gridSizing.trendDirection || 'neutral', 
+          this.gridSizing.trendStrength || 0, 
+          upSpacing, 
+          downSpacing
+        );
+      }
+      
+      this.logger.star(`ATR-based grid ready for real-time updates - current value: ${atrValue.toFixed(2)}`);
     } catch (error) {
       this.logger.error(`Error initializing ATR with historical data: ${(error as Error).message}`)
       this.logger.warn('Falling back to default ATR initialization')
+      
+      // Set a reasonable default ATR value
+      this.gridSizing.lastATRValue = ATR_MINIMUM_GRID_DISTANCE / ATR_MULTIPLIER;
+      this.gridSizing.currentDistance = ATR_MINIMUM_GRID_DISTANCE;
+      this.gridSizing.upwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+      this.gridSizing.downwardGridSpacing = ATR_MINIMUM_GRID_DISTANCE;
+      this.gridSizing.lastRecalculation = Date.now();
     }
   }
 
@@ -1318,7 +1374,64 @@ export class LiveOrderManager {
 
     // Add the trade data to the ATR indicator for volatility calculation
     if (this.atrInstance && trade.price > 0) {
+      // Update ATR with current trade price
       this.atrInstance.add(trade.price, trade.price, trade.price, trade.price);
+      
+      // Check if ATR value has changed significantly
+      const atrValues = this.atrInstance._values as number[];
+      if (atrValues && atrValues.length > 0) {
+        const currentAtr = atrValues[atrValues.length - 1];
+        
+        if (currentAtr && !isNaN(currentAtr)) {
+          // Check if ATR changed significantly compared to last stored value
+          const atrChangeThreshold = 0.1; // 10% change threshold
+          const atrDiffPercent = Math.abs((currentAtr - this.gridSizing.lastATRValue) / this.gridSizing.lastATRValue);
+          
+          if (atrDiffPercent > atrChangeThreshold) {
+            // ATR has changed significantly, update grid spacing immediately
+            this.logger.info(`Significant ATR change detected: ${this.gridSizing.lastATRValue.toFixed(2)} → ${currentAtr.toFixed(2)} (${(atrDiffPercent * 100).toFixed(2)}% change)`);
+            
+            // Calculate new base grid distance based on current ATR
+            const baseGridDistance = Math.min(
+              Math.max(
+                Math.round(currentAtr * ATR_MULTIPLIER),
+                ATR_MINIMUM_GRID_DISTANCE
+              ),
+              ATR_MAXIMUM_GRID_DISTANCE
+            );
+            
+            // Update grid sizing config
+            this.gridSizing.currentDistance = baseGridDistance;
+            this.gridSizing.lastATRValue = currentAtr;
+            this.gridSizing.lastRecalculation = Date.now();
+            
+            // Update trend metrics if available
+            if (this.candles.length >= 5) {
+              const trendAnalysis = this.trendAnalyzer.analyzeTrend();
+              this.updateGridSizingFromTrend(trendAnalysis);
+            }
+            
+            // Update state manager with new grid sizing
+            this.stateManager.updateGridSizing(this.gridSizing);
+            
+            // Record metrics if available
+            if (this.metricsManager) {
+              this.metricsManager.recordATR(currentAtr);
+              this.metricsManager.recordGridDistance(baseGridDistance);
+              
+              const upSpacing = this.gridSizing.upwardGridSpacing || baseGridDistance;
+              const downSpacing = this.gridSizing.downwardGridSpacing || baseGridDistance;
+              
+              this.metricsManager.recordTrendMetrics(
+                this.gridSizing.trendDirection || 'neutral', 
+                this.gridSizing.trendStrength || 0, 
+                upSpacing, 
+                downSpacing
+              );
+            }
+          }
+        }
+      }
     }
 
     // Update candles
@@ -1893,6 +2006,32 @@ export class LiveOrderManager {
    */
   async calculateATRAndUpdateGridSpacing(): Promise<void> {
     try {
+      // Check if we have recent real-time ATR data from trade processing
+      const now = Date.now();
+      const freshAtrAvailable = this.gridSizing.lastATRValue > 0 && 
+                               (now - this.gridSizing.lastRecalculation) < ATR_RECALCULATION_INTERVAL / 2;
+      
+      // If we have fresh ATR data, skip the historical data fetch to reduce API load
+      if (freshAtrAvailable) {
+        this.logger.info(`Using recent ATR value (${this.gridSizing.lastATRValue.toFixed(2)}) from live trade processing`);
+        
+        // Still update trend analysis with existing candles
+        if (this.candles.length >= 5) {
+          // Process candles for trend analysis
+          this.trendAnalyzer.processCandleHistory(this.candles);
+          
+          // Get trend analysis results
+          const trendAnalysis = this.trendAnalyzer.analyzeTrend();
+          this.logger.info(`Current trend analysis: ${trendAnalysis.direction} (strength: ${trendAnalysis.strength.toFixed(2)}, asymmetry: ${trendAnalysis.asymmetryFactor.toFixed(2)})`);
+          
+          // Update grid sizing with trend data
+          this.updateGridSizingFromTrend(trendAnalysis);
+        }
+        
+        return;
+      }
+      
+      // Otherwise, proceed with historical data fetch and full recalculation
       // Fetch historical trades from BitMEX
       const trades = await this.api.getHistoricalTrades(
         this.symbol,
@@ -1986,7 +2125,7 @@ export class LiveOrderManager {
         this.updateGridSizingFromTrend(trendAnalysis);
       }
       
-      // Reset ATR indicator
+      // Reset and initialize ATR with historical data
       this.atrInstance = new ATR([ATR_PERIOD]);
       
       // Feed candles to ATR indicator
@@ -2011,6 +2150,15 @@ export class LiveOrderManager {
         ),
         ATR_MAXIMUM_GRID_DISTANCE
       );
+      
+      // Check if grid spacing changed significantly
+      const gridSpacingChanged = Math.abs(baseGridDistance - this.gridSizing.currentDistance) >= 1;
+      
+      if (gridSpacingChanged) {
+        this.logger.info(`ATR-based grid spacing updated: ${this.gridSizing.currentDistance} → ${baseGridDistance} (ATR: ${atrValue.toFixed(2)})`);
+      } else {
+        this.logger.info(`ATR calculation confirmed current grid spacing: ${baseGridDistance} (ATR: ${atrValue.toFixed(2)})`);
+      }
       
       // Update grid sizing config
       this.gridSizing.currentDistance = baseGridDistance;
@@ -2041,6 +2189,9 @@ export class LiveOrderManager {
           downSpacing
         );
       }
+      
+      // Update breakout detector with current ATR value
+      this.breakoutDetector.updateAtrValue(atrValue);
       
     } catch (error) {
       this.logger.error(`Failed to update grid spacing: ${error}`);
